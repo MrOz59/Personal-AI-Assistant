@@ -31,14 +31,14 @@ class SearchClient {
         .build()
 
     /**
-     * The top results for [query], for someone speaking [english] ("en-AU"), from the SearXNG at
+     * The top results for [query], for someone speaking [language] ("en-AU", "pt-BR"), from the SearXNG at
      * [searxng] (blank: none) or DuckDuckGo. Null if nothing could be found anywhere.
      */
-    suspend fun search(query: String, searxng: String, english: String): Found? = withContext(Dispatchers.IO) {
+    suspend fun search(query: String, searxng: String, language: String): Found? = withContext(Dispatchers.IO) {
         if (searxng.isNotBlank()) {
-            attempt("SearXNG") { searxng(searxng, query, english) }?.let { return@withContext Found(it, "SearXNG") }
+            attempt("SearXNG") { searxng(searxng, query, language) }?.let { return@withContext Found(it, "SearXNG") }
         }
-        attempt("DuckDuckGo") { duckDuckGo(query, english) }?.let { return@withContext Found(it, "DuckDuckGo") }
+        attempt("DuckDuckGo") { duckDuckGo(query, language) }?.let { return@withContext Found(it, "DuckDuckGo") }
         attempt("DuckDuckGo instant answers") { instantAnswers(query) }?.let { Found(it, "DuckDuckGo instant answers") }
     }
 
@@ -47,19 +47,19 @@ class SearchClient {
             .onFailure { android.util.Log.w("Naomi", "$source search failed: ${it.message}") }
             .getOrNull()?.takeIf { it.isNotEmpty() }
 
-    private fun searxng(base: String, query: String, english: String): List<Result>? {
+    private fun searxng(base: String, query: String, language: String): List<Result>? {
         val url = "${base.trimEnd('/')}/search".toHttpUrlOrNull()?.newBuilder()
             ?.addQueryParameter("q", query)
             ?.addQueryParameter("format", "json")
-            ?.addQueryParameter("language", english)
+            ?.addQueryParameter("language", language)
             ?.build() ?: return null
         return get(url.toString())?.let { fromSearxng(JSONObject(it)) }
     }
 
-    private fun duckDuckGo(query: String, english: String): List<Result>? {
+    private fun duckDuckGo(query: String, language: String): List<Result>? {
         val url = "https://html.duckduckgo.com/html/".toHttpUrlOrNull()!!.newBuilder()
             .addQueryParameter("q", query)
-            .addQueryParameter("kl", duckRegion(english))
+            .addQueryParameter("kl", duckRegion(language))
             .build()
         return get(url.toString())?.let(::fromDuckDuckGo)
     }
@@ -78,8 +78,8 @@ class SearchClient {
      * The SearXNG at [base]'s results for [query], for the settings screen's test. Throws, with
      * what went wrong, if it can't be reached or won't answer in JSON.
      */
-    suspend fun trySearxng(base: String, query: String, english: String): List<Result> = withContext(Dispatchers.IO) {
-        searxng(base, query, english) ?: throw IOException("that isn't a server address")
+    suspend fun trySearxng(base: String, query: String, language: String): List<Result> = withContext(Dispatchers.IO) {
+        searxng(base, query, language) ?: throw IOException("that isn't a server address")
     }
 
     private fun get(url: String): String? =
@@ -153,9 +153,11 @@ class SearchClient {
             },
         )
 
-        /** DuckDuckGo's region code for an English locale: "en-AU" → "au-en"; "wt-wt" (no region) if it has none. */
-        fun duckRegion(english: String): String =
-            english.substringAfter('-', "").lowercase().takeIf { it.length == 2 }?.let { "$it-en" } ?: "wt-wt"
+        /** DuckDuckGo's region code for a language tag: "en-AU" → "au-en", "pt-BR" → "br-pt"; "wt-wt" (no region) if it has none. */
+        fun duckRegion(language: String): String {
+            val region = language.substringAfter('-', "").lowercase().takeIf { it.length == 2 } ?: return "wt-wt"
+            return "$region-${language.substringBefore('-').lowercase()}"
+        }
 
         /** The site a link is on, without "www.": "https://www.abc.net.au/news/…" → "abc.net.au". */
         fun siteOf(url: String): String =

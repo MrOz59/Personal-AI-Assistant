@@ -19,6 +19,8 @@ data class TurnContext(
     val memories: List<String> = emptyList(),
     /** The speech recognizer's other guesses at what was just said, when it wasn't sure. */
     val heardAs: List<String> = emptyList(),
+    /** The language she hears and speaks (see [Language.current]). */
+    val language: Language = Language.ENGLISH,
 )
 
 /**
@@ -257,6 +259,9 @@ class CloudBrain(private val llm: LlmClient, private val persona: String) {
             appendLine()
             appendLine("HOW YOU TALK")
             appendLine("You're speaking out loud through a phone; a text-to-speech voice reads every word you write.")
+            ctx.language.replyIn?.let {
+                appendLine("- Always reply in $it: the user talks to you in it, and a $it voice reads your words.")
+            }
             appendLine("- Sound like a friend on a call, not a search engine: contractions, natural rhythm, real reactions.")
             appendLine("- Put some of yourself in every reply — a quip, an opinion, a bit of warmth, or a question back.")
             appendLine("- Quick things get a sentence or two; when they want to chat, a story or an explanation, take a few more.")

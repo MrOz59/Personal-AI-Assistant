@@ -77,6 +77,7 @@ import androidx.compose.material.icons.outlined.Bookmark
 import androidx.compose.material.icons.outlined.Check
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.Delete
+import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material.icons.outlined.Edit
 import androidx.compose.material.icons.outlined.GraphicEq
 import androidx.compose.material.icons.outlined.Home
@@ -88,6 +89,7 @@ import androidx.compose.material.icons.outlined.Notifications
 import androidx.compose.material.icons.outlined.Psychology
 import androidx.compose.material.icons.outlined.RecordVoiceOver
 import androidx.compose.material.icons.outlined.Settings
+import androidx.compose.material.icons.outlined.Translate
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -311,6 +313,10 @@ class MainActivity : ComponentActivity() {
         voiceLog = VoiceLog.recent(this)
         VoiceLog.onChange = voiceLogChanged
         refreshBrainUi()
+        PortugueseModel.onChange = answersModelChanged
+        // Speaking Portuguese: fetch the model that hears quick answers, if it isn't here yet.
+        if (Language.current(this) == Language.PORTUGUESE) PortugueseModel.download(this)
+        refreshLanguageUi()
 
         // Ask for everything Naomi needs up front (mic to listen, contacts + phone to call).
         val missing = neededPermissions.filter {
@@ -393,6 +399,9 @@ class MainActivity : ComponentActivity() {
                         speakerCheck  = speakerCheck,
                         voiceLog      = voiceLog,
                         onClearVoiceLog = { VoiceLog.clear(this@MainActivity) },
+                        languageUi    = languageUi,
+                        onCycleLanguage = { cycleLanguage() },
+                        onDownloadAnswers = { PortugueseModel.download(this@MainActivity) },
                         onThresholdChange = { onThresholdChange(it) },
                         onNavigate    = { screen = it },
                         onOrbTap      = { onMicTapped() },
@@ -430,6 +439,8 @@ class MainActivity : ComponentActivity() {
         super.onResume()
         // Coming back from a system settings screen — refresh the setup checklist + facts.
         refreshSetup()
+        // On Automatic, the phone's language may have changed meanwhile.
+        refreshLanguageUi()
         facts = brain.memory.all()
         memories = brain.memories.all()
         // Freshest voice-match score (WakeService writes it live in this same process).
@@ -739,6 +750,46 @@ class MainActivity : ComponentActivity() {
         status = if (on) "Smart mode on — ${brain.settings.provider.label} is my brain" else "On-device only"
     }
 
+    // ── Language: what Naomi hears and speaks ──────────────────────────────────────
+
+    /**
+     * The Language row in Settings, and — while she speaks Portuguese — the row for the model
+     * that hears a bare "sim" or "não" over her question ([PortugueseModel]).
+     */
+    data class LanguageUi(
+        val summary: String = "",
+        /** How the Portuguese answers model is doing; null unless she speaks Portuguese. */
+        val answersModel: String? = null,
+        val answersReady: Boolean = false,
+    )
+
+    private var languageUi by mutableStateOf(LanguageUi())
+    private val answersModelChanged: () -> Unit = { runOnUiThread { refreshLanguageUi() } }
+
+    private fun refreshLanguageUi() {
+        val chosen = Language.chosen(this)
+        val current = Language.current(this)
+        val model = PortugueseModel.state(this)
+        languageUi = LanguageUi(
+            summary = if (chosen == Language.AUTO) "Automatic — ${current.label}, like your phone" else chosen.label,
+            answersModel = if (current != Language.PORTUGUESE) null else when (model) {
+                PortugueseModel.State.READY -> "Ready — say \"sim\" or \"não\" while she's still asking"
+                PortugueseModel.State.DOWNLOADING -> "Downloading… ${PortugueseModel.percent}%"
+                PortugueseModel.State.FAILED -> "Download failed — tap to try again"
+                PortugueseModel.State.MISSING -> "Tap to download (about 31 MB)"
+            },
+            answersReady = model == PortugueseModel.State.READY,
+        )
+    }
+
+    /** The Language row: Automatic → English → Português (Brasil) → Automatic. */
+    private fun cycleLanguage() {
+        val next = Language.entries[(Language.chosen(this).ordinal + 1) % Language.entries.size]
+        Language.choose(this, next)
+        if (Language.current(this) == Language.PORTUGUESE) PortugueseModel.download(this)
+        refreshLanguageUi()
+    }
+
     // ── Brain: the smart-mode AI, its key, and Naomi's personality ─────────────────
 
     /** Snapshot of the brain settings for the Brain screen. */
@@ -822,7 +873,7 @@ class MainActivity : ComponentActivity() {
         lifecycleScope.launch {
             val started = System.currentTimeMillis()
             val notice = try {
-                val results = SearchClient().trySearxng(url, "weather", VoiceInput.englishHere(this@MainActivity))
+                val results = SearchClient().trySearxng(url, "weather", Language.speechTag(this@MainActivity))
                 if (results.isEmpty()) "✗ It answered, but with no results — are its engines working?"
                 else "✓ ${results.size} results in ${System.currentTimeMillis() - started} ms"
             } catch (e: Exception) {
@@ -1387,6 +1438,7 @@ class MainActivity : ComponentActivity() {
         runCatching { unregisterReceiver(screenOffReceiver) }
         if (brain.memories.onChange === memoriesChanged) brain.memories.onChange = null
         if (VoiceLog.onChange === voiceLogChanged) VoiceLog.onChange = null
+        if (PortugueseModel.onChange === answersModelChanged) PortugueseModel.onChange = null
         // The conversation in progress still gets noted down.
         brain.cancel()
         voice.destroy()
@@ -1454,6 +1506,9 @@ private fun NaomiApp(
     speakerCheck: Boolean?,
     voiceLog: List<String>,
     onClearVoiceLog: () -> Unit,
+    languageUi: MainActivity.LanguageUi,
+    onCycleLanguage: () -> Unit,
+    onDownloadAnswers: () -> Unit,
     onThresholdChange: (Float) -> Unit,
     onNavigate: (MainActivity.Screen) -> Unit,
     onOrbTap: () -> Unit,
@@ -1525,6 +1580,9 @@ private fun NaomiApp(
                     speakerCheck = speakerCheck,
                     voiceLog = voiceLog,
                     onClearVoiceLog = onClearVoiceLog,
+                    languageUi = languageUi,
+                    onCycleLanguage = onCycleLanguage,
+                    onDownloadAnswers = onDownloadAnswers,
                     onThresholdChange = onThresholdChange,
                     onBack = { onNavigate(MainActivity.Screen.HOME) },
                     onWakeToggle = onWakeToggle,
@@ -1999,6 +2057,9 @@ private fun SettingsScreen(
     speakerCheck: Boolean?,
     voiceLog: List<String>,
     onClearVoiceLog: () -> Unit,
+    languageUi: MainActivity.LanguageUi,
+    onCycleLanguage: () -> Unit,
+    onDownloadAnswers: () -> Unit,
     onThresholdChange: (Float) -> Unit,
     onBack: () -> Unit,
     onWakeToggle: () -> Unit,
@@ -2027,6 +2088,24 @@ private fun SettingsScreen(
             Spacer(Modifier.height(4.dp))
 
             SectionLabel("Voice")
+            SettingActionRow(
+                title = "Language",
+                subtitle = languageUi.summary,
+                icon = Icons.Outlined.Translate,
+                accent = CyanAccent,
+                done = false,
+                onClick = onCycleLanguage
+            )
+            languageUi.answersModel?.let { answers ->
+                SettingActionRow(
+                    title = "Quick answers in Portuguese",
+                    subtitle = answers,
+                    icon = Icons.Outlined.Download,
+                    accent = CyanAccent,
+                    done = languageUi.answersReady,
+                    onClick = onDownloadAnswers
+                )
+            }
             SettingToggleRow(
                 title = "Hey Naomi",
                 subtitle = "Always-listening wake word",

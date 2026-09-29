@@ -103,7 +103,8 @@ Grant the mic (and, for calls/messages, contacts + phone) permissions. Then try:
 
 The wake word and voice models are bundled in `app/src/main/assets/` (Vosk + ONNX), so it works out
 of the box. The larger on-device chat model (Gemma) is optional and loaded from device storage
-separately.
+separately. So is Vosk's small Portuguese model (about 31 MB), which Naomi downloads herself the
+first time she speaks Portuguese.
 
 ---
 
@@ -141,7 +142,11 @@ See **[`FILES.md`](FILES.md)** for a one-line description of every source file. 
 - Only the wake phrase is voice-checked, not the sentences after it: Google's speech service needs the
   mic to itself. On a Redmi (HyperOS), recording alongside it made Android silence the service's
   mic, and handing it our own recording (`EXTRA_AUDIO_SOURCE`) got audio in but no words back.
-- Speech is recognized as the English of the country the phone is in (by its mobile network), so
+- She speaks English or Brazilian Portuguese (Settings → Language; *Automatic* follows the phone's
+  language). In Portuguese she hears you in pt-BR, answers in a Portuguese voice, and smart mode
+  replies in Portuguese; the offline commands and her fixed lines are still English. "Naomi" wakes
+  her in either language; greetings around it ("Oi Naomi") need a trained voice.
+- English is recognized as spoken in the country the phone is in (by its mobile network), so
   local names come through — "Woolworths", not "wolves worth". The recognizer is hinted with the
   names she knows, and when its best guess misses one that a runner-up has ("closest work" /
   "closest Woolworths"), the runner-up wins.
