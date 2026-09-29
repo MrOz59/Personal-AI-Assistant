@@ -7,7 +7,7 @@ cloud AI you pick — and she can fall back to a fully on-device LLM.
 
 - **Offline-first:** timers, alarms, time/date, calls, WhatsApp voice/video calls, SMS & WhatsApp
   messages, music, maps/navigation, rides, food, notes, torch, Wi-Fi/Bluetooth, volume, calendar,
-  and "open \<app\>" — all handled on-device by the keyword router.
+  reminders, and "open \<app\>" — all handled on-device by the keyword router.
 - **Smart mode:** a cloud brain of your choice — Groq, Google Gemini, OpenAI, Anthropic Claude, or
   any OpenAI-compatible server (e.g. Ollama on your own PC) — hears every turn, answers in Naomi's
   (editable) personality and runs phone actions. Set it up in the app; no rebuild needed.
@@ -82,6 +82,11 @@ Grant the mic (and, for calls/messages, contacts + phone) permissions. Then try:
 - "what's the weather in Bangalore"
 - "play \<song\>"  •  "open settings"
 - "remember that I parked on level 3" → later, "where did I park?"  •  "forget that"
+- "remind me in 20 minutes to check the oven"  •  "me lembra amanhã às 9 de ligar pro dentista"  •
+  "remind me every weekday at 7:30 to take my pills"  *(offline)* — when it's time she notifies you
+  and says it out loud (not while the phone is silenced, in a call or on Do Not Disturb). "What are
+  my reminders?" and "cancel the dentist reminder" work too. "Add a dentist appointment tomorrow at
+  3pm" puts it straight in your calendar (with calendar permission).
 - Turn on the **"Naomi" wake word** and say "Naomi" from the lock screen.
 - **Voice lock:** Settings → *Train my voice*: say "Naomi" 8 times.
   From then on only your voice wakes her — anyone else hears "Sorry, I don't recognize your voice.

@@ -93,6 +93,18 @@ class Speaker(context: Context) {
     }
 
     /**
+     * [speak], once the voice has loaded — a fresh Speaker takes a moment — for talking from
+     * outside the screen, like a reminder going off. Gives up after about 5 s, calling [onDone].
+     */
+    fun speakWhenReady(text: String, onDone: (() -> Unit)? = null) = speakOnceReady(text, onDone, 0)
+
+    private fun speakOnceReady(text: String, onDone: (() -> Unit)?, waited: Int) {
+        if (ready) { speak(text, onDone); return }
+        if (waited >= 20) { onDone?.let { mainHandler.post(it) }; return }
+        mainHandler.postDelayed({ speakOnceReady(text, onDone, waited + 1) }, 250)
+    }
+
+    /**
      * A short line said while she works on an answer ("Let me check."). The next [speak] follows
      * it instead of cutting it off, and its onDone waits for both.
      */

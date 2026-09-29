@@ -14,8 +14,15 @@
     <uses-permission android:name="android.permission.CALL_PHONE" />
     <uses-permission android:name="android.permission.SEND_SMS" />
 
-    <!-- Calendar: read today's events. -->
+    <!-- Calendar: read today's events, and add one at the time asked ("dentist tomorrow at 3"). -->
     <uses-permission android:name="android.permission.READ_CALENDAR" />
+    <uses-permission android:name="android.permission.WRITE_CALENDAR" />
+
+    <!-- Reminders go off to the minute, also while the phone dozes. Android 13+ grants
+         USE_EXACT_ALARM at install; 12 has SCHEDULE_EXACT_ALARM, which the user can take back
+         (they'd then come within a few minutes instead). -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
 
     <!-- "Hey Naomi" always-listening wake word (Vosk, offline). -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
@@ -143,7 +150,17 @@
             android:foregroundServiceType="microphone"
             android:stopWithTask="false" />
 
-        <!-- Re-arm "Hey Naomi" automatically after the phone reboots. -->
+        <!-- Reminders going off (said aloud + notified), their Snooze/Done buttons, and putting
+             them back on the alarm clock after the app is updated. -->
+        <receiver
+            android:name=".ReminderReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Re-arm "Hey Naomi" (and the reminders) automatically after the phone reboots. -->
         <receiver
             android:name=".BootReceiver"
             android:exported="true"

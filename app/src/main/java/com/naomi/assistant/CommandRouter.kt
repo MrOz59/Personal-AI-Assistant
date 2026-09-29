@@ -46,6 +46,9 @@ class CommandRouter(private val context: Context) {
      */
     var preferredMusicApp: String = ""
 
+    /** Reminders by voice: "remind me to…", "what are my reminders?", "cancel the dentist one". */
+    val reminders by lazy { ReminderCommands(context) }
+
     sealed interface Result {
         data class Handled(val reply: String) : Result
         data object NotHandled : Result
@@ -65,6 +68,11 @@ class CommandRouter(private val context: Context) {
         android.util.Log.d("Naomi", "Router input: \"$input\"")
 
         return when {
+            // --- reminders (ahead of timers and alarms: "remind me to set the alarm" is a reminder) ---
+            ReminderParser.isCancel(rawInput) -> reminders.cancel(rawInput)
+            ReminderParser.isList(rawInput) -> reminders.list(rawInput)
+            ReminderParser.isRequest(rawInput) -> reminders.set(rawInput)
+
             input.contains("timer") -> handleTimer(input)
             input.contains("alarm") -> handleAlarm(input)
             input.matches(Regex(".*\\bwhat('?s| is)? the time\\b.*")) ||
@@ -94,12 +102,10 @@ class CommandRouter(private val context: Context) {
             // --- messaging ---
             Regex("\\b(message|text|whatsapp|dm)\\b").containsMatchIn(input) -> handleMessage(input)
 
-            // --- calendar ---
+            // --- calendar (adding first: "add the dentist to my calendar" mentions the calendar too) ---
+            CALENDAR_ADD.containsMatchIn(input) -> handleCalendarCreate(rawInput)
             input.contains("calendar") || input.contains("my schedule") ||
                 (input.contains("event") && input.contains("today")) -> handleCalendarRead()
-            input.contains("remind me to") || input.contains("add event") ||
-                input.contains("create event") || input.contains("schedule a") ->
-                handleCalendarCreate(input)
 
             // --- course watcher ---
             input.contains("course") && (input.contains("check") || input.contains("new") ||
@@ -520,12 +526,61 @@ class CommandRouter(private val context: Context) {
         }
     }
 
-    fun executeCalendarCreate(title: String): Result {
+    /**
+     * Adds [title] to the calendar at [at], if a time was said: straight into the phone's main
+     * calendar when Naomi may write to it, else the calendar app opens with it filled in, to save.
+     * Replies in Portuguese when [portuguese].
+     */
+    fun executeCalendarCreate(title: String, at: java.time.LocalDateTime? = null, portuguese: Boolean = false): Result {
+        val now = java.time.LocalDateTime.now()
+        val begin = at?.atZone(java.time.ZoneId.systemDefault())?.toInstant()?.toEpochMilli()
+        if (begin != null && hasPermission(Manifest.permission.WRITE_CALENDAR) && insertEvent(title, begin) != null) {
+            return Result.Handled(ReminderText.eventAdded(title, at, now, portuguese))
+        }
         val intent = Intent(Intent.ACTION_INSERT)
             .setData(CalendarContract.Events.CONTENT_URI)
             .putExtra(CalendarContract.Events.TITLE, title)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        return launch(intent, "Opening your calendar to add \"$title\" — set the time and save.")
+        if (begin != null) {
+            intent.putExtra(CalendarContract.EXTRA_EVENT_BEGIN_TIME, begin)
+                .putExtra(CalendarContract.EXTRA_EVENT_END_TIME, begin + EVENT_LENGTH_MS)
+        }
+        return launch(intent, ReminderText.eventOpened(title, at, now, portuguese))
+    }
+
+    /**
+     * [title] as an hour-long event at [begin] in the phone's main writable calendar, with the
+     * usual heads-up ten minutes before. Its id, or null if there's no calendar to write to.
+     */
+    private fun insertEvent(title: String, begin: Long): Long? = try {
+        val calendars = CalendarContract.Calendars.CONTENT_URI
+        val calendar = context.contentResolver.query(
+            calendars,
+            arrayOf(CalendarContract.Calendars._ID),
+            "${CalendarContract.Calendars.VISIBLE} = 1 AND " +
+                "${CalendarContract.Calendars.CALENDAR_ACCESS_LEVEL} >= ${CalendarContract.Calendars.CAL_ACCESS_CONTRIBUTOR}",
+            null,
+            "${CalendarContract.Calendars.IS_PRIMARY} DESC, ${CalendarContract.Calendars._ID} ASC"
+        )?.use { c -> if (c.moveToFirst()) c.getLong(0) else null }
+        calendar?.let { id ->
+            val event = context.contentResolver.insert(CalendarContract.Events.CONTENT_URI, android.content.ContentValues().apply {
+                put(CalendarContract.Events.CALENDAR_ID, id)
+                put(CalendarContract.Events.TITLE, title)
+                put(CalendarContract.Events.DTSTART, begin)
+                put(CalendarContract.Events.DTEND, begin + EVENT_LENGTH_MS)
+                put(CalendarContract.Events.EVENT_TIMEZONE, java.util.TimeZone.getDefault().id)
+            })?.lastPathSegment?.toLongOrNull()
+            event?.also { eventId ->
+                context.contentResolver.insert(CalendarContract.Reminders.CONTENT_URI, android.content.ContentValues().apply {
+                    put(CalendarContract.Reminders.EVENT_ID, eventId)
+                    put(CalendarContract.Reminders.MINUTES, 10)
+                    put(CalendarContract.Reminders.METHOD, CalendarContract.Reminders.METHOD_ALERT)
+                })
+            }
+        }
+    } catch (e: Exception) {
+        android.util.Log.w("Naomi", "Couldn't add the event: ${e.message}")
+        null
     }
 
     fun executeMessage(name: String, body: String, channel: MsgChannel): Result {
@@ -796,11 +851,15 @@ class CommandRouter(private val context: Context) {
         )
     }
 
-    private fun handleCalendarCreate(input: String): Result {
-        val title = listOf("remind me to", "schedule a", "create event", "add event")
-            .map { extractAfter(input, it) }
-            .firstOrNull { it.isNotBlank() } ?: input
-        return executeCalendarCreate(title)
+    /** "Add a dentist appointment tomorrow at 3" / "marca uma reunião na sexta às 10": the event, at the time said. */
+    private fun handleCalendarCreate(said: String): Result {
+        val at = ReminderParser.parseWhen(said, java.time.LocalDateTime.now())?.at
+        val title = ReminderParser.withoutWhen(said)
+            .replace(CALENDAR_ADD_WORDS, " ")
+            .replace(Regex("\\s+"), " ").trim().trim('.', '!', '?', ':', ' ')
+            .replace(Regex("^(?:for|to|called|de|do|da|para|pra|chamad[oa])\\s+", RegexOption.IGNORE_CASE), "")
+            .replaceFirstChar { it.uppercase() }
+        return executeCalendarCreate(title.ifBlank { said.trim() }, at, ReminderParser.isPortuguese(said))
     }
 
     private fun handleRide(input: String): Result {
@@ -1197,6 +1256,23 @@ class CommandRouter(private val context: Context) {
             .format(Calendar.getInstance().time) + "."
 
     companion object {
+        // "Add a dentist appointment tomorrow at 3", "schedule a meeting", "marca uma reunião na sexta".
+        private val CALENDAR_ADD = Regex(
+            "\\b(?:add|put|create|schedule|book)\\b.*\\b(?:event|meeting|appointment|(?:to|on|in)\\s+(?:my|the)\\s+calendar)\\b|" +
+                "\\bschedule\\s+an?\\b|" +
+                "\\b(?:marca|marque|agenda|agende|cria|crie|adiciona|adicione|coloca|coloque|põe|poe|bota)\\b.*" +
+                "\\b(?:evento|compromisso|reunião|reuniao|consulta|na\\s+(?:minha\\s+)?agenda|no\\s+(?:meu\\s+)?calend[áa]rio)\\b"
+        )
+        // What's said around an event's name, and isn't part of it.
+        private val CALENDAR_ADD_WORDS = Regex(
+            "\\b(?:hey|naomi|please|can you|could you|add|put|create|schedule|book|an?|new|event|" +
+                "(?:to|on|in|into)\\s+(?:my|the)\\s+calendar|por\\s+favor|marca|marque|agenda|agende|cria|crie|adiciona|adicione|" +
+                "coloca|coloque|põe|poe|bota|um|uma|novo|nova|evento|na\\s+(?:minha\\s+)?agenda|no\\s+(?:meu\\s+)?calend[áa]rio)\\b",
+            RegexOption.IGNORE_CASE
+        )
+        // How long an event added by voice lasts, when all that was said is when it starts.
+        private const val EVENT_LENGTH_MS = 60 * 60_000L
+
         /** Music app display-name → package, in preference order for auto-detect. */
         val APP_TO_PKG = linkedMapOf(
             "spotify"       to "com.spotify.music",
