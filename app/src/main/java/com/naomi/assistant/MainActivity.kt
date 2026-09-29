@@ -840,8 +840,13 @@ class MainActivity : ComponentActivity() {
         onConversationToggle = { brain.settings.conversationMode = it; refreshBrainUi() },
         onSaveSearch = { url ->
             brain.settings.searchUrl = url
+            val pc = BrainSettings.pcSearch(brain.settings.customBaseUrl)
             brainUi = brainUi.copy(searchUrl = brain.settings.searchUrl,
-                searchNotice = if (url.isBlank()) "✓ Saved — she'll search DuckDuckGo" else "✓ Saved")
+                searchNotice = when {
+                    url.isNotBlank() -> "✓ Saved"
+                    pc.isNotBlank() -> "✓ Saved — she'll search your PC's SearXNG ($pc), or DuckDuckGo when it's off"
+                    else -> "✓ Saved — she'll search DuckDuckGo"
+                })
         },
         onTestSearch = { url -> testSearch(url) },
     )
@@ -863,8 +868,9 @@ class MainActivity : ComponentActivity() {
         )
     }
 
-    /** One search through the SearXNG on screen (saved or not), reporting how it went. */
-    private fun testSearch(url: String) {
+    /** One search through the SearXNG on screen (saved or not) — or, blank, the one on the brain's PC — reporting how it went. */
+    private fun testSearch(typed: String) {
+        val url = typed.ifBlank { BrainSettings.pcSearch(brain.settings.customBaseUrl) }
         if (url.isBlank()) {
             brainUi = brainUi.copy(searchNotice = "✗ Add your SearXNG's address first.")
             return
@@ -875,7 +881,7 @@ class MainActivity : ComponentActivity() {
             val notice = try {
                 val results = SearchClient().trySearxng(url, "weather", Language.speechTag(this@MainActivity))
                 if (results.isEmpty()) "✗ It answered, but with no results — are its engines working?"
-                else "✓ ${results.size} results in ${System.currentTimeMillis() - started} ms"
+                else "✓ ${results.size} results in ${System.currentTimeMillis() - started} ms" + if (typed.isBlank()) " from $url" else ""
             } catch (e: Exception) {
                 "✗ ${e.message ?: e.javaClass.simpleName}"
             }
@@ -2344,9 +2350,10 @@ private fun BrainScreen(
             SectionLabel("Looking things up")
             NaomiTextField(searchUrl, { searchUrl = it }, "SearXNG server (optional)", keyboardOptions = plain)
             Text(
-                "In smart mode she answers questions about news, scores, prices and the like by searching first. " +
-                    "Your own SearXNG with JSON output on, e.g. http://<pc>.<tailnet>.ts.net:8888. Blank, or when " +
-                    "it can't be reached, she searches DuckDuckGo from the phone.",
+                "In smart mode she answers questions about news, scores, prices and the like by searching first, " +
+                    "and reads the top pages when the results alone don't say. Your own SearXNG with JSON output on, " +
+                    "e.g. http://<pc>.<tailnet>.ts.net:8888 (see pc/searxng in the repo). Blank: the one on your Custom " +
+                    "brain's PC at port 8888, if there is one. When it can't be reached, she searches DuckDuckGo from the phone.",
                 fontFamily = InterFamily, fontSize = 12.sp,
                 color = OnSurfaceVariant.copy(alpha = 0.6f)
             )

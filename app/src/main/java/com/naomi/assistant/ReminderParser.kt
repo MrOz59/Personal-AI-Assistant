@@ -328,12 +328,8 @@ object ReminderParser {
         }
     }
 
-    /**
-     * A case-insensitive pattern where `\b` is a word boundary for any alphabet — Java's own `\b`
-     * doesn't see "à" or "ã" as letters (Android's does), so "às 5" would go unread in tests.
-     */
-    private fun rx(pattern: String) = Regex(pattern.replace("\\b", WORD_EDGE), RegexOption.IGNORE_CASE)
-    private const val WORD_EDGE = "(?:(?<![\\p{L}\\p{N}_])(?=[\\p{L}\\p{N}_])|(?<=[\\p{L}\\p{N}_])(?![\\p{L}\\p{N}_]))"
+    // "às 5" has to read the same in unit tests as on the phone: see [wordRegex].
+    private fun rx(pattern: String) = wordRegex(pattern)
 
     private val SPACES = Regex("\\s{2,}")
     private val DEFAULT_TIME: LocalTime = LocalTime.of(9, 0)

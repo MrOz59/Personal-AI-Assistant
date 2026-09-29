@@ -31,6 +31,9 @@ A brief map of every source file in `app/src/main/java/com/naomi/assistant/`.
 | `LlmClient.kt` | The wire protocols behind every provider: OpenAI-compatible chat completions (Groq, OpenAI, Ollama, …), Anthropic Messages, and Gemini generateContent. |
 | `BrainSettings.kt` | Which provider/model is the brain, its API key (Keystore-encrypted, kept out of backups), the personality, and conversation mode. |
 | `LocalBrain.kt` | Fully-offline on-device LLM (Gemma 3 1B int4 via MediaPipe). The conversational fallback when smart mode is off or there's no network. |
+| `LookUp.kt` | A look-up from start to end: search, answer from the results' snippets while the top pages load, and from the pages' passages when the snippets don't say — never more than two calls to the brain. |
+| `SearchClient.kt` | Web search for live questions: the owner's SearXNG (by default the one on the brain's PC, port 8888 over Tailscale — see `pc/searxng/`), else DuckDuckGo. Results come with their site, date and address; a SearXNG that just failed is skipped for two minutes. |
+| `PageReader.kt` | Reads the top two result pages on the phone: `https` only and never an address in the owner's own network (checked again after DNS and on every redirect), five seconds for both. Keeps the article's text without menus or sidebars, and picks the passages sharing the question's rarer words. |
 
 ## Memory & extras
 
@@ -44,6 +47,7 @@ A brief map of every source file in `app/src/main/java/com/naomi/assistant/`.
 | `DeviceLocation.kt` | The phone's location and neighbourhood name (fused location + geocoder), cached for a few minutes. |
 | `VoiceRecorder.kt` | In-app voice memo recorder — saves M4A files to public storage via MediaStore. |
 | `WhatsAppSender.kt` | Accessibility service. Auto-taps WhatsApp's Send button after Naomi opens a chat, and provides general on-screen control (tap / scroll / type by voice) for other apps. |
+| `WordRegex.kt` | Regexes whose word edges (`\b`) work with accented letters, so "amanhã" or "está" end where they should. |
 | `ReminderParser.kt` | Reading a reminder out of what was said, in English or Portuguese: what it's about, and when ("tomorrow at 9", "in 20 minutes", "na sexta às 3 da tarde", "every weekday at 7:30", "todo dia 10"). An hour said without AM/PM is the next one that makes sense. Also tells a list or cancel request from a new reminder. |
 | `ReminderStore.kt` | Reminders that are set (`naomi_reminders.json`), soonest first, with repeats (daily, weekdays, weekly, monthly) moved on to their next time once they go off; finds the one meant by a few of its words. |
 | `ReminderCommands.kt` | Setting, listing and cancelling reminders by voice — asking what or when when either was left out. |

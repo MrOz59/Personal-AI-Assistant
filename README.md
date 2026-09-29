@@ -69,8 +69,17 @@ on the network (`sudo systemctl edit ollama` → `Environment="OLLAMA_HOST=0.0.0
 on Tailscale only (e.g. `sudo ufw allow in on tailscale0 to any port 11434 proto tcp`), then use
 **Custom** with `http://<pc>.<tailnet>.ts.net:11434/v1` and the model's name. For self-hosted models
 the app has the server enforce the reply format, so even 1B models keep to it — but they pick the
-wrong action more often than big ones; 3B+ is noticeably better. To judge a model with Naomi's real
+wrong action more often than big ones; 3B+ is noticeably better. Her prompts run to about 2,600 tokens, so check that
+`ollama ps` shows a CONTEXT of 4096 or more (older Ollama versions default to 2048; set
+`OLLAMA_CONTEXT_LENGTH=4096` or higher on the server). To judge a model with Naomi's real
 prompt: `NAOMI_LLM_URL=http://127.0.0.1:11434/v1 NAOMI_LLM_MODEL=<name> ./gradlew :app:testDebugUnitTest --tests '*LiveBrainTest*' -i`.
+
+**Web search (live questions):** scores, prices, opening hours, news. She searches your own
+[SearXNG](pc/searxng/README.md) on the PC (free: `docker compose up -d`, then
+`tailscale serve --bg --http=8888 8080`) and, when the results alone don't answer, reads the top
+two pages on the phone. With the Custom brain at `http://<pc>.<tailnet>.ts.net:…` she finds it on
+port 8888 by herself; otherwise put its address under **SearXNG server**. Without one she searches
+DuckDuckGo directly, which answers less.
 
 ---
 
@@ -80,6 +89,7 @@ Grant the mic (and, for calls/messages, contacts + phone) permissions. Then try:
 - "set a timer for 2 minutes"  *(offline)*
 - "call \<contact\>" / "WhatsApp video call \<contact\>"  *(offline)*
 - "what's the weather in Bangalore"
+- "who won the Palmeiras game last night?"  •  "quanto tá o dólar hoje?"  *(smart mode; see Web search above)*
 - "play \<song\>"  •  "open settings"
 - "remember that I parked on level 3" → later, "where did I park?"  •  "forget that"
 - "remind me in 20 minutes to check the oven"  •  "me lembra amanhã às 9 de ligar pro dentista"  •
@@ -153,6 +163,8 @@ See **[`FILES.md`](FILES.md)** for a one-line description of every source file. 
 - "Nearest" questions send the phone's approximate location to OpenStreetMap's search (Nominatim)
   and routers (OSRM); distances to named places use the platform geocoder and OSRM; bus and train
   directions ask Transitous, with the start and end points.
+- Live questions send the search words to your SearXNG (which asks Google, DuckDuckGo, Bing, Brave
+  and Wikipedia) or to DuckDuckGo, and the phone itself opens up to two of the result pages.
 - This is a personal/hobby project — the WhatsApp calling and accessibility features depend on those
   apps' current layouts and may need tweaks over time.
 
