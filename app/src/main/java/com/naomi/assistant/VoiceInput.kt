@@ -49,9 +49,10 @@ class VoiceInput(context: Context) {
     data class Heard(val text: String, val alternatives: List<String> = emptyList(), val audio: ShortArray? = null)
 
     private val appContext = context.applicationContext
-    // English as spoken where the phone is — the recognizer then knows local names (Woolworths,
-    // not "wolves worth") and accents.
-    private val language = englishHere(context)
+    // The language picked in Settings, read on each listen so a change applies at once. English
+    // is English as spoken where the phone is — the recognizer then knows local names
+    // (Woolworths, not "wolves worth") and accents.
+    private val language: String get() = Language.speechTag(appContext)
     private var onResult: ((Heard) -> Unit)? = null
     private var onError: ((String) -> Unit)? = null
     private var triedFallback = false
@@ -126,14 +127,14 @@ class VoiceInput(context: Context) {
             if (error == SpeechRecognizer.ERROR_CLIENT && !triedClientRetry) {
                 triedClientRetry = true
                 recognizer?.cancel()
-                handler.postDelayed({ start(useRegionalEnglish = true) }, 350)
+                handler.postDelayed({ start(useLanguage = true) }, 350)
                 return
             }
-            // If the local English isn't available (12/13), retry once in the device's default language.
+            // If the chosen language isn't available (12/13), retry once in the device's default language.
             if (error in intArrayOf(12, 13) && !triedFallback) {
                 triedFallback = true
                 recognizer?.cancel()
-                start(useRegionalEnglish = false)
+                start(useLanguage = false)
                 return
             }
             onError?.invoke(describeError(error))
@@ -164,7 +165,7 @@ class VoiceInput(context: Context) {
             }
         else null
 
-    private fun buildIntent(useRegionalEnglish: Boolean, source: ParcelFileDescriptor?) =
+    private fun buildIntent(useLanguage: Boolean, source: ParcelFileDescriptor?) =
         Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false)
@@ -176,8 +177,8 @@ class VoiceInput(context: Context) {
             // A pause to think mid-sentence shouldn't end it (a hint: services may not honour it).
             putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1_200L)
             putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1_000L)
-            // The local English; the device's default language if the service doesn't have it.
-            val tag = testLanguage ?: language.takeIf { useRegionalEnglish }
+            // The chosen language; the device's default language if the service doesn't have it.
+            val tag = testLanguage ?: language.takeIf { useLanguage }
             if (tag != null) {
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE, tag)
                 putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, tag)
@@ -210,7 +211,7 @@ class VoiceInput(context: Context) {
         alternatives = emptyList()
         recognizer.cancel()
         endCapture()
-        start(useRegionalEnglish = true)
+        start(useLanguage = true)
     }
 
     /**
@@ -224,14 +225,14 @@ class VoiceInput(context: Context) {
     }
 
     /** Starts recognition on the service's own mic (debug: on the test audio, fed to it instead). */
-    private fun start(useRegionalEnglish: Boolean) {
+    private fun start(useLanguage: Boolean) {
         val rec = recognizer ?: return
         val own = testAudio?.let { Capture(it) }
         capture = own
         startedAt = SystemClock.elapsedRealtime()
         readyAt = 0L
         speechAt = 0L
-        rec.startListening(buildIntent(useRegionalEnglish, own?.source))
+        rec.startListening(buildIntent(useLanguage, own?.source))
         // Fed our audio, the service never gives up by itself when nobody speaks.
         if (own?.testing == true) handler.postDelayed(noSpeech, NO_SPEECH_MS)
     }

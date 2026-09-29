@@ -81,6 +81,7 @@ class SearchTest {
     @Test
     fun regionsAndSites() {
         assertEquals("au-en", SearchClient.duckRegion("en-AU"))
+        assertEquals("br-pt", SearchClient.duckRegion("pt-BR"))
         assertEquals("wt-wt", SearchClient.duckRegion("en"))
         assertEquals("abc.net.au", SearchClient.siteOf("https://www.abc.net.au/news/story?x=1"))
         assertEquals("example.com", SearchClient.siteOf("  example.com/path "))

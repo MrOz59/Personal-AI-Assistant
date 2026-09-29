@@ -48,6 +48,14 @@ import org.vosk.android.StorageService
 class WakeService : Service() {
 
     private var model: Model? = null
+    // In Portuguese: the model that hears a bare answer, once downloaded ([PortugueseModel]).
+    // Loaded in the background; [answerModelLock] keeps one that finishes loading as the service
+    // is destroyed from being left open.
+    @Volatile private var answerModel: Model? = null
+    private val answerModelLock = Any()
+    @Volatile private var answerModelLoading = false
+    @Volatile private var answerModelUnusable = false
+    private var destroyed = false
     private var recognizer: Recognizer? = null
     private var record: AudioRecord? = null
     private var echoCanceler: AcousticEchoCanceler? = null
@@ -123,7 +131,9 @@ class WakeService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_PAUSE -> { enrollMode = false; armed = false; stopWake() } // Activity is about to use the mic itself
-            ACTION_ANSWER -> { answerMode = true; enrollMode = false; startForegroundCompat(); armWhenReady() }
+            // In Portuguese, a bare answer is heard only once its model is loaded; until then only
+            // "Naomi" cuts her off, and the answer is heard after she's done.
+            ACTION_ANSWER -> { answerMode = hearsAnswers(); enrollMode = false; startForegroundCompat(); armWhenReady() }
             ACTION_ENROLL -> {
                 answerMode = false; enrollMode = true
                 startForegroundCompat()
@@ -140,6 +150,7 @@ class WakeService : Service() {
     /** Load the model if needed, then start listening. */
     private fun armWhenReady() {
         armed = true
+        if (Language.current(this) == Language.PORTUGUESE) loadAnswerModel()
         val m = model
         if (m != null) { startWake(m); return }
         StorageService.unpack(
@@ -149,14 +160,47 @@ class WakeService : Service() {
         )
     }
 
+    /** Whether a bare answer can be heard over her question: in Portuguese, only by its own model. */
+    private fun hearsAnswers(): Boolean = Language.current(this) != Language.PORTUGUESE || answerModel != null
+
+    /** Loads the downloaded Portuguese model in the background, if it isn't loaded or loading. */
+    private fun loadAnswerModel() {
+        if (answerModel != null || answerModelLoading || answerModelUnusable || !PortugueseModel.isReady(this)) return
+        if (!PortugueseModel.takesGrammar(this)) {
+            answerModelUnusable = true
+            VoiceLog.add(this, "The Portuguese model can't be held to answer words, so answers are heard after she speaks")
+            return
+        }
+        answerModelLoading = true
+        val path = PortugueseModel.dir(this).absolutePath
+        thread(name = "naomi-pt-load") {
+            val loaded = try {
+                Model(path)
+            } catch (e: Exception) {
+                android.util.Log.e("Naomi", "Portuguese model load failed: ${e.message}")
+                null
+            }
+            synchronized(answerModelLock) {
+                answerModelLoading = false
+                answerModelUnusable = loaded == null
+                if (destroyed) loaded?.close() else answerModel = loaded
+            }
+        }
+    }
+
     @Suppress("MissingPermission") // RECORD_AUDIO is required before wake is enabled
     private fun startWake(m: Model) {
         stopWake() // ensure no double recognizer/record
         try {
             // Answer mode uses a restricted grammar of confirmation/choice words so it endpoints
-            // instantly and stays robust in noise; wake mode uses the "naomi" grammar.
-            val grammar = if (answerMode) ANSWER_GRAMMAR else WAKE_GRAMMAR
-            recognizer = Recognizer(m, SAMPLE_RATE.toFloat(), grammar).apply { setWords(true) }
+            // instantly and stays robust in noise; wake mode uses the "naomi" grammar. Answers in
+            // Portuguese are heard by the Portuguese model.
+            val portugueseModel = answerModel?.takeIf { answerMode && Language.current(this) == Language.PORTUGUESE }
+            recognizer = when {
+                portugueseModel != null -> Recognizer(portugueseModel, SAMPLE_RATE.toFloat(), ANSWER_GRAMMAR_PT)
+                answerMode -> Recognizer(m, SAMPLE_RATE.toFloat(), ANSWER_GRAMMAR)
+                else -> Recognizer(m, SAMPLE_RATE.toFloat(), WAKE_GRAMMAR)
+            }.apply { setWords(true) }
             val minBuf = AudioRecord.getMinBufferSize(
                 SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
             )
@@ -574,6 +618,11 @@ class WakeService : Service() {
         verifier.shutdown()
         speaker.shutdown()
         model?.close()
+        synchronized(answerModelLock) {
+            destroyed = true
+            answerModel?.close()
+            answerModel = null
+        }
         super.onDestroy()
     }
 
@@ -639,6 +688,15 @@ class WakeService : Service() {
             "\"whatsapp\", \"whats app\", \"text\", \"message\", \"sms\", " +
             "\"change message\", \"change the message\", \"change contact\", \"change the contact\", " +
             "\"one\", \"two\", \"three\", \"[unk]\"]"
+
+        // The same in Brazilian Portuguese, for the Portuguese model. Vosk leaves out (and logs)
+        // any word the model doesn't know, so a missing one costs only that answer.
+        private const val ANSWER_GRAMMAR_PT =
+            "[\"sim\", \"isso\", \"pode\", \"pode mandar\", \"manda\", \"envia\", \"certo\", \"claro\", " +
+            "\"não\", \"cancela\", \"cancelar\", " +
+            "\"whatsapp\", \"zap\", \"texto\", \"sms\", " +
+            "\"muda a mensagem\", \"mudar a mensagem\", \"muda o contato\", \"mudar o contato\", " +
+            "\"um\", \"dois\", \"três\", \"[unk]\"]"
 
         /** Set by MainActivity — receives a recognized follow-up answer (on the main thread). */
         @Volatile var answerCallback: ((String) -> Unit)? = null

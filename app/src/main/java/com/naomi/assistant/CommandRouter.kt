@@ -127,7 +127,7 @@ class CommandRouter(private val context: Context) {
                 executeWebSearch(firstAfter(input, "search for", "google", "look up", "search"))
 
             // --- rides / food / notes / email / device controls ---
-            input.contains("uber") || input.contains("ola") || input.contains("rapido") ||
+            RIDE_APPS.containsMatchIn(input) ||
                 ((input.contains("book") || input.contains("get me")) &&
                     (input.contains("cab") || input.contains("ride") || input.contains("taxi"))) ->
                 handleRide(input)
@@ -322,7 +322,7 @@ class CommandRouter(private val context: Context) {
                 "com.rapido.passenger", "Rapido", destination,
                 "where to|drop|enter drop|drop location|where are you going|destination|search"
             )
-            app.contains("ola") -> openRideWithDestination(
+            OLA.containsMatchIn(app) -> openRideWithDestination(
                 "com.olacabs.customer", "Ola", destination,
                 "where to|drop|enter drop|drop location|destination|search"
             )
@@ -576,7 +576,7 @@ class CommandRouter(private val context: Context) {
             isChangeContact(a) -> changeContact("Who should I send it to?", body, viaWhatsApp)
             isChangeMessage(a) -> changeMessage(contact, body, viaWhatsApp)
             isNo(a) -> Result.Handled("Okay, cancelled.")
-            a.contains("whatsapp") || a.contains("whats app") || a.contains("dm") ->
+            a.contains("whatsapp") || a.contains("whats app") || a.contains("dm") || ZAP.containsMatchIn(a) ->
                 sendWhatsApp(contact, body)
             a.contains("text") || a.contains("sms") ||
                 a.contains("normal") || a.contains("regular") ->
@@ -622,23 +622,6 @@ class CommandRouter(private val context: Context) {
                 }
             }
         }
-
-    private fun isChangeMessage(a: String): Boolean =
-        listOf("change the message", "change message", "change my message", "edit the message",
-            "edit message", "different message", "say it again", "rephrase", "correct the message")
-            .any { a.contains(it) }
-
-    private fun isChangeContact(a: String): Boolean =
-        listOf("change the contact", "change contact", "change the name", "change name",
-            "wrong person", "wrong contact", "different person", "different contact", "someone else")
-            .any { a.contains(it) }
-
-    private fun isYes(a: String): Boolean =
-        Regex("\\b(yes|yeah|yep|yup|ok|okay|sure|send|correct|fine|do it|go ahead)\\b")
-            .containsMatchIn(a)
-
-    private fun isNo(a: String): Boolean =
-        Regex("\\b(no|nope|cancel|stop|don't|dont|wrong|nah|wait)\\b").containsMatchIn(a)
 
     private fun sendWhatsApp(contact: Pair<String, String>, body: String): Result {
         val (display, number) = contact
@@ -805,7 +788,7 @@ class CommandRouter(private val context: Context) {
 
     private fun handleRide(input: String): Result {
         val app = when {
-            input.contains("ola") -> "ola"
+            OLA.containsMatchIn(input) -> "ola"
             input.contains("rapido") -> "rapido"
             else -> "uber"
         }
@@ -867,10 +850,10 @@ class CommandRouter(private val context: Context) {
                     // Convert spoken number words ("one" -> "1") and accept ordinals / "number 2".
                     val a = wordsToDigits(reply.trim().lowercase(Locale.getDefault()))
                     val ordinal = when {
-                        a.contains("first") -> 1
-                        a.contains("second") -> 2
-                        a.contains("third") -> 3
-                        else -> null
+                        a.contains("first") || a.contains("primeir") -> 1
+                        a.contains("second") || a.contains("segund") -> 2
+                        a.contains("third") || a.contains("terceir") -> 3
+                        else -> portugueseNumber(a)
                     }
                     val idx = ordinal ?: Regex("\\d+").find(a)?.value?.toIntOrNull()
                     val chosen = when {
@@ -1197,6 +1180,41 @@ class CommandRouter(private val context: Context) {
             .format(Calendar.getInstance().time) + "."
 
     companion object {
+        // Ride apps named as whole words: "escola" and "Uberlândia" aren't rides.
+        private val RIDE_APPS = Regex("\\b(uber|ola|rapido)\\b")
+        private val OLA = Regex("\\bola\\b")
+        // WhatsApp, as it's called in Brazil.
+        private val ZAP = Regex("\\bzap(zap)?\\b")
+
+        // Answers to her questions ("Send it?"), in English and Brazilian Portuguese.
+        private val YES = Regex("\\b(yes|yeah|yep|yup|ok|okay|sure|send|correct|fine|do it|go ahead|" +
+            "sim|isso|pode|manda|mande|envia|envie|certo|claro|beleza|confirmo)\\b")
+        private val NO = Regex("\\b(no|nope|cancel|stop|don't|dont|wrong|nah|wait|" +
+            "não|nao|cancela|cancelar|cancele|errado|errada|espera)\\b")
+        private val CHANGE_MESSAGE_PT =
+            Regex("\\b(mud|troc|corrig|alter|edit)\\w*\\s+(a |o |de )?(mensagem|texto)\\b|\\boutra mensagem\\b")
+        private val CHANGE_CONTACT_PT =
+            Regex("\\b(mud|troc|alter)\\w*\\s+(o |a |de )?(contato|nome|pessoa)\\b|\\b(outra pessoa|outro contato|pessoa errada|contato errado)\\b")
+        private val PORTUGUESE_NUMBERS = mapOf("um" to 1, "uma" to 1, "dois" to 2, "duas" to 2, "três" to 3, "tres" to 3)
+
+        internal fun isChangeMessage(a: String): Boolean =
+            listOf("change the message", "change message", "change my message", "edit the message",
+                "edit message", "different message", "say it again", "rephrase", "correct the message")
+                .any { a.contains(it) } || CHANGE_MESSAGE_PT.containsMatchIn(a)
+
+        internal fun isChangeContact(a: String): Boolean =
+            listOf("change the contact", "change contact", "change the name", "change name",
+                "wrong person", "wrong contact", "different person", "different contact", "someone else")
+                .any { a.contains(it) } || CHANGE_CONTACT_PT.containsMatchIn(a)
+
+        internal fun isYes(a: String): Boolean = YES.containsMatchIn(a)
+
+        internal fun isNo(a: String): Boolean = NO.containsMatchIn(a)
+
+        /** "dois" → 2: the first Portuguese number up to three in [a], for picking from a short list. */
+        internal fun portugueseNumber(a: String): Int? =
+            a.split(Regex("\\s+")).firstNotNullOfOrNull { PORTUGUESE_NUMBERS[it.trim(',', '.', '!', '?')] }
+
         /** Music app display-name → package, in preference order for auto-detect. */
         val APP_TO_PKG = linkedMapOf(
             "spotify"       to "com.spotify.music",

@@ -166,6 +166,20 @@ class CloudBrainTest {
     }
 
     @Test
+    fun sheRepliesInTheLanguageSheSpeaks() {
+        val ctx = TurnContext(mapOf("name" to "Ozzy"), language = Language.PORTUGUESE)
+        for (prompt in listOf(
+            CloudBrain.systemPrompt("You are Naomi.", ctx, Date(0)),
+            CloudBrain.chatPrompt("You are Naomi.", ctx, Date(0)),
+            CloudBrain.narrationPrompt("You are Naomi.", ctx, Date(0), "Battery is at 23 percent."),
+            CloudBrain.answerPrompt("You are Naomi.", ctx, Date(0)),
+        )) {
+            assertTrue(prompt.contains("Always reply in Brazilian Portuguese"))
+        }
+        assertFalse(CloudBrain.systemPrompt("You are Naomi.", TurnContext(mapOf("name" to "Ozzy")), Date(0)).contains("Always reply in"))
+    }
+
+    @Test
     fun theRecognizersOtherGuessesReachTheBrain() {
         val ctx = TurnContext(mapOf("name" to "Ozzy"), heardAs = listOf("how can I get to the closest Woolworths by bus"))
         val prompt = CloudBrain.systemPrompt("You are Naomi.", ctx, Date(0))

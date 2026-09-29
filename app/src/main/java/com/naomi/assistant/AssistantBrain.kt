@@ -271,6 +271,7 @@ class AssistantBrain(context: Context) {
             speaker = speaker,
             memories = recall(userText, speaker),
             heardAs = heardAs,
+            language = Language.current(appContext),
         )
         turnCtx = ctx
         val response = try {
@@ -619,7 +620,7 @@ class AssistantBrain(context: Context) {
      */
     private suspend fun lookUpReply(query: String, asked: String): Reply {
         onAside?.invoke(LOOKING.random())
-        val found = search.search(query, settings.searchUrl, VoiceInput.englishHere(appContext))
+        val found = search.search(query, settings.searchUrl, Language.speechTag(appContext))
         val openSearch = { router.executeWebSearch(query) }
         if (found == null) {
             offer = openSearch
@@ -965,10 +966,11 @@ class AssistantBrain(context: Context) {
             RegexOption.IGNORE_CASE)
         // A little life for directions told as they come, when her own retelling isn't to be had.
         private val OPENERS = listOf("Right, bus it is.", "Easy one.", "Here's the plan.", "Got you covered.")
-        // Taking or declining an offer she just made.
-        private val YES_TO_OFFER = Regex("^(oh |well |ok |okay )?(yes|yeah|yep|yup|sure|please|ok|okay|go ahead|do it|open it|why not)\\b",
+        // Taking or declining an offer she just made, in English or Brazilian Portuguese.
+        private val YES_TO_OFFER = Regex("^(oh |well |ok |okay )?(yes|yeah|yep|yup|sure|please|ok|okay|go ahead|do it|open it|why not|" +
+            "sim|claro|pode|quero|abre|por favor|beleza)\\b", RegexOption.IGNORE_CASE)
+        private val NO_TO_OFFER = Regex("^(oh |well |ok |okay )?(no|nope|nah|no thanks|not now|don'?t|não|nao|agora não|deixa pra lá)\\b",
             RegexOption.IGNORE_CASE)
-        private val NO_TO_OFFER = Regex("^(oh |well |ok |okay )?(no|nope|nah|no thanks|not now|don'?t)\\b", RegexOption.IGNORE_CASE)
         // Words for "the place we were just talking about".
         private val PLACE_PRONOUNS = setOf("it", "there", "that", "that place", "this place", "the place", "the store",
             "the shop", "that one", "the same place")
