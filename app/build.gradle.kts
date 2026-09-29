@@ -30,6 +30,12 @@ android {
         }
         buildConfigField("String", "GEMINI_API_KEY", "\"${localProps.getProperty("GEMINI_API_KEY", "")}\"")
         buildConfigField("String", "GROQ_API_KEY", "\"${localProps.getProperty("GROQ_API_KEY", "")}\"")
+
+        // Optional ABI_FILTERS=arm64-v8a in local.properties packages native libs for just those
+        // ABIs — roughly halves the APK when sideloading to your own phone. Unset = all ABIs.
+        localProps.getProperty("ABI_FILTERS")?.let { abis ->
+            ndk { abiFilters += abis.split(",").map { it.trim() } }
+        }
     }
 
     buildTypes {
@@ -46,6 +52,11 @@ android {
     buildFeatures {
         compose = true
         buildConfig = true
+    }
+    // android.util.Log & co. return defaults in JVM unit tests instead of throwing, so tests can
+    // drive real app classes (e.g. LiveBrainTest → CloudBrain.respond).
+    testOptions {
+        unitTests.isReturnDefaultValues = true
     }
 }
 
@@ -68,6 +79,9 @@ dependencies {
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.17.3")      // speaker verification (ECAPA-TDNN)
     implementation("com.google.android.gms:play-services-location:21.3.0")      // one-tap "turn on location" dialog
     testImplementation(libs.junit)
+    // Android's own org.json for unit tests (android.jar only has stubs). Unlike json.org's, it keeps
+    // key order like the device does — which matters for the JSON Schemas we send.
+    testImplementation("com.vaadin.external.google:android-json:0.0.20131108.vaadin1")
     androidTestImplementation(platform(libs.androidx.compose.bom))
     androidTestImplementation(libs.androidx.compose.ui.test.junit4)
     androidTestImplementation(libs.androidx.espresso.core)

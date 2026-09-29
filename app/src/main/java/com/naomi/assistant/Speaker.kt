@@ -25,13 +25,14 @@ class Speaker(context: Context) {
         if (status == TextToSpeech.SUCCESS) { ready = true; pickVoice() }
     }.also {
         it.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-            override fun onStart(utteranceId: String?) {}
+            override fun onStart(utteranceId: String?) { speaking = true }
             override fun onDone(utteranceId: String?) {
+                speaking = false
                 pendingOnDone?.let { cb -> pendingOnDone = null; mainHandler.post(cb) }
             }
             @Deprecated("deprecated in API 21")
-            override fun onError(utteranceId: String?) { pendingOnDone = null }
-            override fun onError(utteranceId: String?, errorCode: Int) { pendingOnDone = null }
+            override fun onError(utteranceId: String?) { speaking = false; pendingOnDone = null }
+            override fun onError(utteranceId: String?, errorCode: Int) { speaking = false; pendingOnDone = null }
         })
     }
 
@@ -74,11 +75,19 @@ class Speaker(context: Context) {
 
     fun stop() {
         pendingOnDone = null
+        speaking = false
         tts.stop()
     }
 
     fun shutdown() {
+        speaking = false
         tts.stop()
         tts.shutdown()
+    }
+
+    companion object {
+        /** True while any Naomi voice is talking — lets the wake listener tell her own voice,
+         *  leaking back into the mic, from a stranger's. */
+        @Volatile var speaking = false
     }
 }

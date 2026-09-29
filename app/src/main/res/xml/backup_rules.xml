@@ -1,13 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?><!--
-   Sample backup rules file; uncomment and customize as necessary.
+   Backup rules for Android 11 and lower (12+ uses data_extraction_rules.xml).
    See https://developer.android.com/guide/topics/data/autobackup
-   for details.
-   Note: This file is ignored for devices older than API 31
-   See https://developer.android.com/about/versions/12/backup-restore
 -->
 <full-backup-content>
-    <!--
-   <include domain="sharedpref" path="."/>
-   <exclude domain="sharedpref" path="device.xml"/>
--->
+    <!-- Brain settings hold the API keys. They're Keystore-encrypted and unreadable on another
+         device anyway, so keep them out of backups entirely. -->
+    <exclude domain="sharedpref" path="naomi_brain.xml"/>
 </full-backup-content>

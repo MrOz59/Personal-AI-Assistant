@@ -1171,32 +1171,6 @@ class CommandRouter(private val context: Context) {
         return null
     }
 
-    /**
-     * Converts spelled-out numbers up to 99 into digits, e.g.
-     * "set a timer for twenty five minutes" -> "set a timer for 25 minutes".
-     */
-    private fun wordsToDigits(text: String): String {
-        val tokens = text.split(Regex("\\s+")).toMutableList()
-        val out = StringBuilder()
-        var i = 0
-        while (i < tokens.size) {
-            val word = tokens[i].trim(',', '.')
-            val units = UNITS[word]
-            val tens = TENS[word]
-            when {
-                // "twenty five" -> 25
-                tens != null && i + 1 < tokens.size && UNITS[tokens[i + 1].trim(',', '.')] != null -> {
-                    out.append(tens + UNITS[tokens[i + 1].trim(',', '.')]!!).append(' ')
-                    i += 2
-                }
-                tens != null -> { out.append(tens).append(' '); i++ }
-                units != null -> { out.append(units).append(' '); i++ }
-                else -> { out.append(tokens[i]).append(' '); i++ }
-            }
-        }
-        return out.toString().trim()
-    }
-
     private fun humanDuration(seconds: Int): String = when {
         seconds % 3600 == 0 -> "${seconds / 3600} hour(s)"
         seconds % 60 == 0 -> "${seconds / 60} minute(s)"
@@ -1237,6 +1211,80 @@ class CommandRouter(private val context: Context) {
             "twenty" to 20, "thirty" to 30, "forty" to 40, "fifty" to 50,
             "sixty" to 60, "seventy" to 70, "eighty" to 80, "ninety" to 90
         )
+
+        /**
+         * Converts spelled-out numbers up to 99 into digits, e.g.
+         * "set a timer for twenty five minutes" -> "set a timer for 25 minutes".
+         */
+        internal fun wordsToDigits(text: String): String {
+            val tokens = text.split(Regex("\\s+")).toMutableList()
+            val out = StringBuilder()
+            var i = 0
+            while (i < tokens.size) {
+                val word = tokens[i].trim(',', '.')
+                val units = UNITS[word]
+                val tens = TENS[word]
+                when {
+                    // "twenty five" -> 25
+                    tens != null && i + 1 < tokens.size && UNITS[tokens[i + 1].trim(',', '.')] != null -> {
+                        out.append(tens + UNITS[tokens[i + 1].trim(',', '.')]!!).append(' ')
+                        i += 2
+                    }
+                    tens != null -> { out.append(tens).append(' '); i++ }
+                    units != null -> { out.append(units).append(' '); i++ }
+                    else -> { out.append(tokens[i]).append(' '); i++ }
+                }
+            }
+            return out.toString().trim()
+        }
+
+        /**
+         * Total seconds in a spoken duration — "five minutes", "1 hour 30 minutes", "half an
+         * hour" — or null if the text names none. Lets the user's own words win over a model's
+         * reading of them.
+         */
+        fun spokenSeconds(text: String): Int? {
+            val t = wordsToDigits(text.lowercase(Locale.ROOT))
+            if (Regex("\\bhalf an? hour\\b").containsMatchIn(t)) return 1800
+            val parts = Regex("(\\d+)\\s*(hours?|hrs?|minutes?|mins?|seconds?|secs?)\\b").findAll(t).toList()
+            if (parts.isEmpty()) return null
+            return parts.sumOf { m ->
+                val n = m.groupValues[1].toInt()
+                when {
+                    m.groupValues[2].startsWith("h") -> n * 3600
+                    m.groupValues[2].startsWith("m") -> n * 60
+                    else -> n
+                }
+            }.takeIf { it > 0 }
+        }
+
+        /**
+         * The literal body of "text X that Y" / "message X saying Y" — exactly what the user
+         * said, which a model tends to paraphrase or embellish — or null.
+         */
+        fun spokenMessage(text: String): String? =
+            Regex("\\b(?:text|message|whatsapp|sms|dm)\\b.*?\\b(?:that|saying|to say)\\b\\s+(.+)", RegexOption.IGNORE_CASE)
+                .find(text)?.groupValues?.get(1)?.trim()?.takeIf { it.isNotEmpty() }
+
+        /**
+         * A spoken clock time — "6:30", "six thirty pm", "7 am", "at 7" — as 24-hour
+         * (hour, minute), or null if the text doesn't clearly name one.
+         */
+        fun spokenClock(text: String): Pair<Int, Int>? {
+            val t = wordsToDigits(text.lowercase(Locale.ROOT)).replace(Regex("\\b([ap])\\.?m\\.?(?=\\s|$)"), "$1m")
+            val m = Regex("\\b(\\d{1,2})[:.](\\d{2})\\s*([ap]m)?").find(t)
+                ?: Regex("\\b(\\d{1,2})\\s+(\\d{2})\\s*([ap]m)?\\b").find(t)
+                ?: Regex("\\b(\\d{1,2})()\\s*([ap]m)\\b").find(t)
+                ?: Regex("\\bat\\s+(\\d{1,2})()()\\b(?!\\s*(minutes?|mins?|hours?|seconds?))").find(t)
+                ?: return null
+            var hour = m.groupValues[1].toInt()
+            val minute = m.groupValues[2].ifEmpty { "0" }.toInt()
+            when (m.groupValues[3]) {
+                "pm" -> if (hour < 12) hour += 12
+                "am" -> if (hour == 12) hour = 0
+            }
+            return if (hour in 0..23 && minute in 0..59) hour to minute else null
+        }
     }
 }
 

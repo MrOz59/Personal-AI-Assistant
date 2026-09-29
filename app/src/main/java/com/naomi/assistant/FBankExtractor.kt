@@ -3,62 +3,63 @@ package com.naomi.assistant
 import kotlin.math.*
 
 /**
- * Kaldi-compatible 80-dim log-mel filterbank feature extractor.
- * Matches the WeSpeaker preprocessor config:
- *   sample_rate=16000, frame_length=25ms, frame_shift=10ms, num_mel_bins=80,
- *   window_type=hamming, f_min=20 Hz, f_max=7600 Hz, no energy coefficient.
+ * Kaldi-compatible 80-dim log-mel filterbank, configured exactly like WeSpeaker's front-end
+ * (torchaudio.compliance.kaldi.fbank with window_type=hamming, dither=0, use_energy=false),
+ * followed by per-utterance mean normalisation (CMN) — the features the speaker model was
+ * trained on. Any mismatch here silently wrecks the voiceprints, so FBankExtractorTest checks
+ * the output against kaldi-native-fbank.
  *
- * Designed to run on the main Android thread or a coroutine dispatcher — pure Kotlin, no deps.
+ * Input is raw 16 kHz PCM-16 in its int16 range: WeSpeaker does NOT scale samples to [-1, 1].
+ * Pure Kotlin, no deps.
  */
 object FBankExtractor {
 
-    private const val SAMPLE_RATE = 16000
-    private const val WIN_LENGTH  = 400   // 25 ms at 16 kHz
-    private const val HOP_LENGTH  = 160   // 10 ms at 16 kHz
-    private const val N_FFT       = 512
-    const  val N_MELS             = 80
-    private const val F_MIN       = 20.0
-    private const val F_MAX       = 7600.0
+    private const val SAMPLE_RATE  = 16000
+    private const val FRAME_LENGTH = 400     // 25 ms
+    private const val FRAME_SHIFT  = 160     // 10 ms
+    private const val N_FFT        = 512     // FRAME_LENGTH rounded up to a power of two
+    const  val N_MELS              = 80
+    private const val LOW_FREQ     = 20.0
+    private const val HIGH_FREQ    = SAMPLE_RATE / 2.0  // Kaldi high_freq=0 → Nyquist
+    private const val PREEMPHASIS  = 0.97
+    private const val LOG_FLOOR    = 1.1920929e-7       // FLT_EPSILON, Kaldi's floor before the log
 
-    private val HAMMING: FloatArray = FloatArray(WIN_LENGTH) { n ->
-        (0.54 - 0.46 * cos(2 * PI * n / (WIN_LENGTH - 1))).toFloat()
+    private val HAMMING = DoubleArray(FRAME_LENGTH) { n ->
+        0.54 - 0.46 * cos(2 * PI * n / (FRAME_LENGTH - 1))
     }
 
-    // Mel filterbank weights [N_MELS × (N_FFT/2+1)] — computed once at first access.
-    private val MEL_FILTERS: Array<FloatArray> by lazy { buildMelFilters() }
+    // Mel filterbank weights [N_MELS × N_FFT/2] — computed once at first access.
+    private val MEL_WEIGHTS: Array<DoubleArray> by lazy { buildMelWeights() }
 
-    private fun hzToMel(hz: Double) = 2595.0 * log10(1.0 + hz / 700.0)
-    private fun melToHz(mel: Double) = 700.0 * (10.0.pow(mel / 2595.0) - 1.0)
+    private fun mel(hz: Double) = 1127.0 * ln(1.0 + hz / 700.0)
 
-    private fun buildMelFilters(): Array<FloatArray> {
-        val numBins = N_FFT / 2 + 1
-        val melMin  = hzToMel(F_MIN)
-        val melMax  = hzToMel(F_MAX)
-        // N_MELS + 2 linearly spaced mel points, converted back to Hz, then to FFT bins
-        val hz = DoubleArray(N_MELS + 2) { i ->
-            melToHz(melMin + i * (melMax - melMin) / (N_MELS + 1))
-        }
-        val bin = IntArray(N_MELS + 2) { i ->
-            ((hz[i] / SAMPLE_RATE) * N_FFT).toInt().coerceIn(0, numBins - 1)
-        }
-        return Array(N_MELS) { m ->
-            FloatArray(numBins) { k ->
-                val lo = bin[m]; val mid = bin[m + 1]; val hi = bin[m + 2]
+    /**
+     * Kaldi MelBanks: triangles evenly spaced on the mel scale, each evaluated at every FFT
+     * bin's own mel frequency (not snapped to bin edges). Bins run 0 until N_FFT/2 — Kaldi
+     * never uses the Nyquist bin.
+     */
+    private fun buildMelWeights(): Array<DoubleArray> {
+        val melLow = mel(LOW_FREQ)
+        val delta = (mel(HIGH_FREQ) - melLow) / (N_MELS + 1)
+        val binWidth = SAMPLE_RATE.toDouble() / N_FFT
+        return Array(N_MELS) { b ->
+            val left = melLow + b * delta
+            val center = left + delta
+            val right = center + delta
+            DoubleArray(N_FFT / 2) { k ->
+                val m = mel(k * binWidth)
                 when {
-                    k in (lo + 1) until mid  -> (k - lo).toFloat() / (mid - lo).coerceAtLeast(1)
-                    k == mid                  -> 1f
-                    k in (mid + 1) until hi  -> (hi - k).toFloat() / (hi - mid).coerceAtLeast(1)
-                    else                      -> 0f
+                    m <= left || m >= right -> 0.0
+                    m <= center             -> (m - left) / (center - left)
+                    else                    -> (right - m) / (right - center)
                 }
             }
         }
     }
 
-    /** In-place radix-2 Cooley-Tukey FFT; returns power spectrum |X[k]|² for k in 0..N/2. */
-    private fun powerSpectrum(frame: FloatArray): FloatArray {
-        val n  = N_FFT
-        val re = DoubleArray(n) { if (it < frame.size) frame[it].toDouble() else 0.0 }
-        val im = DoubleArray(n)
+    /** In-place radix-2 Cooley-Tukey FFT over [re]/[im] (length N_FFT). */
+    private fun fft(re: DoubleArray, im: DoubleArray) {
+        val n = N_FFT
 
         // Bit-reversal
         var j = 0
@@ -92,28 +93,55 @@ object FBankExtractor {
             }
             len = len shl 1
         }
-
-        return FloatArray(n / 2 + 1) { k -> (re[k] * re[k] + im[k] * im[k]).toFloat() }
     }
 
+    /** Frames Kaldi produces for [samples] samples (snip_edges=true: no partial frames). */
+    fun numFrames(samples: Int): Int =
+        if (samples < FRAME_LENGTH) 0 else 1 + (samples - FRAME_LENGTH) / FRAME_SHIFT
+
     /**
-     * Computes log-mel features from raw PCM-16 audio (16 kHz mono).
+     * Computes CMN'd log-mel features from raw PCM-16 audio (16 kHz mono).
      * Returns a flat [frames × N_MELS] FloatArray and the frame count,
      * ready to wrap in an ONNX tensor of shape [1, frames, N_MELS].
      */
     fun compute(audio: ShortArray): Pair<FloatArray, Int> {
-        val filters   = MEL_FILTERS
-        val numFrames = ((audio.size - WIN_LENGTH) / HOP_LENGTH + 1).coerceAtLeast(0)
+        val filters   = MEL_WEIGHTS
+        val numFrames = numFrames(audio.size)
         val out       = FloatArray(numFrames * N_MELS)
+        val re        = DoubleArray(N_FFT)
+        val im        = DoubleArray(N_FFT)
 
         for (f in 0 until numFrames) {
-            val start = f * HOP_LENGTH
-            val frame = FloatArray(WIN_LENGTH) { i -> (audio[start + i] / 32768f) * HAMMING[i] }
-            val power = powerSpectrum(frame)
+            val start = f * FRAME_SHIFT
+            // Kaldi frame processing order: remove DC → pre-emphasis → window → zero-pad.
+            var mean = 0.0
+            for (i in 0 until FRAME_LENGTH) mean += audio[start + i]
+            mean /= FRAME_LENGTH
+            for (i in 0 until FRAME_LENGTH) re[i] = audio[start + i] - mean
+            for (i in FRAME_LENGTH - 1 downTo 1) re[i] -= PREEMPHASIS * re[i - 1]
+            re[0] -= PREEMPHASIS * re[0]
+            for (i in 0 until FRAME_LENGTH) re[i] *= HAMMING[i]
+            re.fill(0.0, FRAME_LENGTH, N_FFT)
+            im.fill(0.0)
+            fft(re, im)
+
             for (m in 0 until N_MELS) {
-                var energy = 0f
-                for (k in power.indices) energy += filters[m][k] * power[k]
-                out[f * N_MELS + m] = ln(energy.coerceAtLeast(1e-6f))
+                val w = filters[m]
+                var energy = 0.0
+                for (k in w.indices) {
+                    if (w[k] != 0.0) energy += w[k] * (re[k] * re[k] + im[k] * im[k])
+                }
+                out[f * N_MELS + m] = ln(max(energy, LOG_FLOOR)).toFloat()
+            }
+        }
+
+        // CMN: subtract each mel bin's mean over the clip (WeSpeaker applies no variance norm).
+        if (numFrames > 0) {
+            for (m in 0 until N_MELS) {
+                var sum = 0.0
+                for (f in 0 until numFrames) sum += out[f * N_MELS + m]
+                val avg = (sum / numFrames).toFloat()
+                for (f in 0 until numFrames) out[f * N_MELS + m] -= avg
             }
         }
         return out to numFrames

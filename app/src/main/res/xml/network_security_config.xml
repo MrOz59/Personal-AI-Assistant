@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+   Everything is HTTPS-only, except plain HTTP to a "Custom" brain on your own machine: a local
+   server (Ollama, LM Studio) reached over Tailscale by its MagicDNS name. Tailscale already
+   encrypts that traffic end to end.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">ts.net</domain>
+        <domain includeSubdomains="false">localhost</domain>
+        <domain includeSubdomains="false">127.0.0.1</domain>
+    </domain-config>
+</network-security-config>
