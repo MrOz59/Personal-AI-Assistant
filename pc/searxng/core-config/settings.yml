@@ -1,0 +1,50 @@
+# Private SearXNG for Naomi. Anything not set here comes from SearXNG's own defaults.
+use_default_settings:
+  engines:
+    # The only engines loaded. Fewer engines, less waiting on slow ones.
+    keep_only:
+      - google       # best Brazilian results, but it breaks now and then, so never alone
+      - duckduckgo
+      - bing
+      - brave
+      - wikipedia    # the summary box Naomi reads first
+
+general:
+  instance_name: "Naomi"
+  enable_metrics: true   # /stats shows each engine's response time and errors
+
+server:
+  # Required: SearXNG refuses to start with this default key. Put a random one here
+  # (Linux: openssl rand -hex 32 — the README has the Windows command).
+  secret_key: "ultrasecretkey"
+  limiter: false         # on, it answers the app with HTTP 429 (made for public servers)
+  public_instance: false # true turns the limiter on
+  image_proxy: false     # the app reads JSON, no images to proxy
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "pt-BR"  # the web page's language; the app sends its own with every search
+  formats:
+    - html
+    - json               # without it, the app gets HTTP 403
+  suspended_times:
+    # One Google CAPTCHA turns Google off for a week by default; 6 hours instead.
+    recaptcha_SearxEngineCaptcha: 21600
+
+outgoing:
+  request_timeout: 2.5     # how long each engine gets (default 3.0)
+  max_request_timeout: 3.0 # the most a search ever waits on a slow engine
+
+# Some of these ship disabled; turned on here. Names only: no "engine:" keys in overrides.
+engines:
+  - name: google
+    disabled: false
+  - name: duckduckgo
+    disabled: false
+  - name: bing
+    disabled: false
+  - name: brave
+    disabled: false
+  - name: wikipedia
+    disabled: false

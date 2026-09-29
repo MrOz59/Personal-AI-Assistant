@@ -1,0 +1,22 @@
+# SearXNG for Naomi: a private search server on your PC, for your phone only, reached over Tailscale.
+# Based on https://github.com/searxng/searxng/blob/master/container/docker-compose.yml, without Valkey
+# (only SearXNG's limiter uses it, and the limiter stays off) and with the port on this PC only
+# (`tailscale serve` puts it on your tailnet). Setup: README.md next to this file.
+# Update: docker compose pull && docker compose up -d
+name: searxng
+services:
+  core:
+    container_name: searxng-core
+    # If Docker Hub refuses the pull (rate limit): ghcr.io/searxng/searxng:latest
+    image: docker.io/searxng/searxng:latest
+    restart: always
+    ports:
+      # This PC only. Never "8080:8080": that's every network the PC is on, and Docker's
+      # published ports get past ufw.
+      - "127.0.0.1:8080:8080"
+    volumes:
+      # settings.yml lives here. On Fedora/RHEL (SELinux) add :Z at the end.
+      - ./core-config/:/etc/searxng/
+      - core-data:/var/cache/searxng/
+volumes:
+  core-data:

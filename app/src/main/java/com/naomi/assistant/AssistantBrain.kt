@@ -41,6 +41,7 @@ class AssistantBrain(context: Context) {
     private val distance = DistanceClient(context.applicationContext)
     private val transit = TransitClient()
     private val search = SearchClient()
+    private val pageReader = PageReader()
     val memory = MemoryStore(context.applicationContext)
     /** What she's learned about the owner, and notes on past conversations. */
     val memories = MemoryBank.get(context.applicationContext)
@@ -91,6 +92,10 @@ class AssistantBrain(context: Context) {
     private var contactNamesAt = 0L
     // Set by a turn that was an explicit "remember that…"/"forget…": nothing more to learn from it.
     private var memoryTurn = false
+    // This turn's "Let me check." has been said already (see [cloudTurn]); and it was answered by
+    // looking it up, in her own voice already, so there's nothing to retell.
+    private var lookingSaid = false
+    private var lookedUp = false
 
     // What was learned last, and when: "forget that" right after means these.
     @Volatile private var lastLearned: List<Long> = emptyList()
@@ -127,6 +132,8 @@ class AssistantBrain(context: Context) {
         val herLastLine = history.lastOrNull()?.second
         chatTurn = false
         memoryTurn = false
+        lookingSaid = false
+        lookedUp = false
         turnCtx = null
         this.heardAs = heardAs
 
@@ -261,6 +268,14 @@ class AssistantBrain(context: Context) {
             return dispatch(action, intent, userText, say = "")
         }
 
+        // She said she'd look it up, but the brain that reads the results is out of reach: the search itself still works.
+        if (lookingSaid) {
+            val query = searchQuery(userText)
+            offer = { router.executeWebSearch(query) }
+            return Reply(if (Language.current(appContext) == Language.PORTUGUESE)
+                "Não consegui falar com o meu cérebro agora. Quer que eu abra a pesquisa no celular?"
+                else "I can't reach my brain right now. Want me to open the search on your phone?", listenAgain = true)
+        }
         return Reply(
             if (smartMode && settings.isConfigured()) "I can't reach my cloud brain right now, and that one's beyond me offline."
             else "Sorry, I didn't catch that — I can do timers, alarms, calls, music, messages, calendar, and answer questions."
@@ -269,6 +284,14 @@ class AssistantBrain(context: Context) {
 
     /** One turn through the cloud brain, or null if it couldn't be reached (caller falls back). */
     private suspend fun cloudTurn(cloud: CloudBrain, userText: String, speaker: Who): Reply? {
+        // A question only a search can answer ("who won last night?"): she says she's checking now,
+        // rather than after the brain has decided to, and a small brain skips its chat pass —
+        // what she'll say is the answer from the search.
+        val live = looksLive(userText)
+        if (live) {
+            onAside?.invoke(lookingLine(Language.current(appContext)))
+            lookingSaid = true
+        }
         val ctx = TurnContext(
             // A guest hears nothing of the owner's life — only their name, so she never calls the guest by it.
             facts = if (speaker == Who.GUEST) memory.all().filterKeys { it == "name" } else memory.all(),
@@ -281,7 +304,7 @@ class AssistantBrain(context: Context) {
         )
         turnCtx = ctx
         val response = try {
-            cloud.respond(userText, history.toList(), ctx)
+            cloud.respond(userText, history.toList(), ctx, chat = !live)
         } catch (e: LlmException) {
             android.util.Log.e("Naomi", "Cloud brain failed: ${e.message}")
             return null
@@ -309,7 +332,8 @@ class AssistantBrain(context: Context) {
     /** [reply]'s report retold in her voice, or [reply] as is if the retelling fails its check.
      *  Questions (follow-ups awaiting an answer) are left alone. */
     private suspend fun narrated(cloud: CloudBrain, userText: String, reply: Reply, ctx: TurnContext): Reply {
-        if (reply.listenAgain) return reply
+        // A looked-up answer is in her voice already: retelling it would be one more slow call to the brain.
+        if (reply.listenAgain || lookedUp) return reply
         return cloud.narrate(userText, reply.text, history.toList(), ctx)
             ?.let { reply.copy(text = it) } ?: reply
     }
@@ -516,10 +540,7 @@ class AssistantBrain(context: Context) {
             if (routed !is CommandRouter.Result.NotHandled) return resultToReply(routed) { Reply("I couldn't do that.") }
         }
         // "Who won last night?", "google the cricket score": looked up, never answered from a model's memory.
-        val bare = lower.replace(LEADING_NAME, "").trim()
-        if ((QUESTION_START.containsMatchIn(bare) && LIVE_QUESTION.containsMatchIn(bare)) || SEARCH_REQUEST.containsMatchIn(bare)) {
-            return lookUpReply(searchQuery(userText), userText)
-        }
+        if (looksLive(userText)) return lookUpReply(searchQuery(userText), userText)
         return null
     }
 
@@ -639,28 +660,45 @@ class AssistantBrain(context: Context) {
      * on the phone.
      */
     private suspend fun lookUpReply(query: String, asked: String): Reply {
-        onAside?.invoke(LOOKING.random())
-        val found = search.search(query, settings.searchUrl, Language.speechTag(appContext))
+        val language = turnCtx?.language ?: Language.current(appContext)
+        val pt = language == Language.PORTUGUESE
+        if (!lookingSaid) onAside?.invoke(lookingLine(language))
+        lookingSaid = true
+        lookedUp = true
+        val speech = Language.speechTag(appContext)
+        val ctx = turnCtx
+        val cloud = cloud()
+        val lookUp = LookUp(
+            search = { q ->
+                search.search(q, settings.searchServer, speech)
+                    ?.also { android.util.Log.i("Naomi", "Looked up \"$q\" on ${it.source}: ${it.results.size} results") }
+            },
+            read = { results, question -> pageReader.read(results, question, speech) },
+            answer = { results, pages, creative ->
+                if (ctx == null || cloud == null) CloudBrain.Attempt(null, CloudBrain.Verdict.UNREACHABLE)
+                else cloud.tryAnswer(asked, query, results, history.toList(), ctx, pages, creative)
+            },
+        )
         val openSearch = { router.executeWebSearch(query) }
-        if (found == null) {
-            offer = openSearch
-            return Reply("I couldn't get any search results just now. Want me to open the search on your phone?", listenAgain = true)
+        return when (val outcome = lookUp.run(query, asked)) {
+            is LookUp.Outcome.Answered -> Reply(outcome.say, listenAgain = settings.conversationMode && !isGoodbye(asked))
+            LookUp.Outcome.NoResults -> {
+                offer = openSearch
+                Reply(if (pt) "Não consegui resultados da busca agora. Quer que eu abra a pesquisa no celular?"
+                    else "I couldn't get any search results just now. Want me to open the search on your phone?", listenAgain = true)
+            }
+            is LookUp.Outcome.NotAnswered -> {
+                // No answer in the results or the pages, or none she could word without making things
+                // up: the top snippet is as likely a page's footnotes as the answer, so it isn't read
+                // out instead. Her own line on it stays, unless it asks something itself.
+                offer = openSearch
+                val said = outcome.say?.takeUnless { it.trimEnd().endsWith("?") }
+                    ?: if (pt) "Achei algumas páginas, mas nada que respondesse com certeza."
+                    else "I found a few pages, but couldn't pin down a clear answer."
+                Reply("$said ${if (pt) "Quer que eu abra a pesquisa?" else "Want me to open the search?"}", listenAgain = true)
+            }
         }
-        android.util.Log.i("Naomi", "Looked up \"$query\" on ${found.source}: ${found.results.size} results")
-        val answer = turnCtx?.let { ctx -> cloud()?.answerFrom(asked, query, found.results, history.toList(), ctx) }
-        if (answer != null && answer.found) {
-            return Reply(answer.say, listenAgain = settings.conversationMode && !isGoodbye(asked))
-        }
-        // No answer in the results, or none she could word without making things up: the top
-        // snippet is as likely a page's footnotes as the answer, so it isn't read out instead.
-        offer = openSearch
-        val said = answer?.say ?: "I found a few pages, but couldn't pin down a clear answer."
-        return Reply("$said Want me to open the search?", listenAgain = true)
     }
-
-    /** What to search for when all there is to go on is what they said: "google the cricket score" → "the cricket score". */
-    private fun searchQuery(said: String): String =
-        SEARCH_REQUEST.find(said.replace(LEADING_NAME, "").trim())?.groupValues?.get(1)?.trim('?', '.', '!', ' ') ?: said.trim('?', '.', '!', ' ')
 
     /**
      * Words the recognizer should listen out for: her name, the owner's, people and places in her
@@ -952,7 +990,7 @@ class AssistantBrain(context: Context) {
         // "Forget that" within this long of learning something means that.
         private const val JUST_LEARNED_MS = 10 * 60_000L
 
-        private val LEADING_NAME = Regex("^(hey |ok |okay )?naomi[,.!]?\\s+", RegexOption.IGNORE_CASE)
+        private val LEADING_NAME = Regex("^(hey |ok |okay |oi |ei |olá |ola )?naomi[,.!]?\\s+", RegexOption.IGNORE_CASE)
         // "remember that…", "please don't forget…", "can you keep in mind…" — but not "remember to…"
         // (a reminder) or "remember when…" (a question).
         private val REMEMBER = Regex(
@@ -984,6 +1022,38 @@ class AssistantBrain(context: Context) {
             "july", "august", "september", "october", "november", "december")
         // What she says as she starts looking something up, so the wait isn't silent.
         private val LOOKING = listOf("Let me check.", "One sec, I'll look it up.", "Hang on, let me look.", "Checking now.")
+        private val LOOKING_PT = listOf("Deixa eu ver.", "Um segundo, vou pesquisar.", "Peraí, vou dar uma olhada.", "Vou pesquisar.")
+
+        private fun lookingLine(language: Language) = (if (language == Language.PORTUGUESE) LOOKING_PT else LOOKING).random()
+
+        /**
+         * Whether [said] is a question only something current can answer ("who won last night?",
+         * "quanto tá o dólar?") or an outright request to search ("google the cricket score",
+         * "pesquisa o horário do jogo") — looked up, never answered from a model's memory.
+         */
+        internal fun looksLive(said: String): Boolean {
+            val bare = said.trim().replace(LEADING_NAME, "").trim()
+            if (SEARCH_REQUEST.containsMatchIn(bare) || SEARCH_REQUEST_PT.containsMatchIn(bare)) return true
+            // An exclamation isn't a question: "que notícia boa!".
+            if (bare.endsWith("!")) return false
+            if (QUESTION_START.containsMatchIn(bare) && LIVE_QUESTION.containsMatchIn(bare)) return true
+            // A reminder, an alarm or a message that mentions the game is still a reminder, alarm or message.
+            if (COMMAND_PT.containsMatchIn(bare)) return false
+            // In Portuguese a question often starts like a statement ("o mercado abre hoje?"): then only the
+            // question mark, when the recognizer adds one, says it's a question.
+            val asked = bare.endsWith("?") || QUESTION_START_PT.containsMatchIn(bare)
+            return (asked && LIVE_QUESTION_PT.containsMatchIn(bare)) || LIVE_ALONE_PT.containsMatchIn(bare)
+        }
+
+        /**
+         * What to search for when all there is to go on is what they said: "google the cricket
+         * score" → "the cricket score", "pesquisa o preço do dólar" → "o preço do dólar"; the
+         * question itself otherwise.
+         */
+        internal fun searchQuery(said: String): String {
+            val bare = said.trim().replace(LEADING_NAME, "").trim()
+            return ((SEARCH_REQUEST.find(bare) ?: SEARCH_REQUEST_PT.find(bare))?.groupValues?.get(1) ?: bare).trim('?', '.', '!', ' ')
+        }
         // "Search for…", "google…", "look up…": the words after are the search.
         private val SEARCH_REQUEST = Regex("^(?:(?:can|could|would|will) you |please )*(?:search(?: the web| online| google)?" +
             "(?: for)?|google|look up|find out)\\s+(.+)$", RegexOption.IGNORE_CASE)
@@ -996,6 +1066,51 @@ class AssistantBrain(context: Context) {
         private val LIVE_QUESTION = Regex("\\b(who won|who'?s winning|score|scores|latest|news|headlines|price of|stock price|" +
             "exchange rate|opening hours|open (now|today|tonight|tomorrow|until)|release date|(come|comes|coming) out)\\b",
             RegexOption.IGNORE_CASE)
+        // The same in Brazilian Portuguese: a question, by how it starts — not by "que", "tem" or "tá" alone,
+        // which as often start a remark ("que notícia boa", "tá bom")…
+        private val QUESTION_START_PT = wordRegex("^(quem|qual|quais|quando|onde|quanto|quanta|quantos|quantas|o que|oque|" +
+            "cadê|cade|será que|sera que|me (diz|diga|fala|fale|conta|conte)|(você|voce|vc) sabe|sabe me dizer|" +
+            "sabe (quem|quanto|qual|quais|quando|onde|se|que horas|o que)|(at[ée] )?que (horas|dia)|como (tá|ta|está|esta|foi|ficou)|" +
+            "j[áa] (saiu|come[çc]ou|abriu|acabou|terminou)|(t[áa]|est[áa]) (aberto|aberta|abertos|abertas|fechado|fechada|quanto)|" +
+            "e (o|a|os|as) \\S+( \\S+)? hoje)\\b")
+        // …about something current: results, prices, opening hours, release dates.
+        private val LIVE_QUESTION_PT = wordRegex("\\b(quem (ganhou|venceu|marcou)|quem (tá|ta|está|esta) (ganhando|vencendo)|placar|" +
+            "resultado d[oa]s? (jogo|partida|cl[áa]ssico|elei[çc][ãa]o|elei[çc][õo]es|mega|loteria|lotof[áa]cil|quina|sorteio|final|" +
+            "corrida|luta|(?-i:\\p{Lu})\\p{L}*)|(ganhou|venceu|perdeu|empatou)( \\S+){0,3} (ontem|hoje|anteontem|domingo|s[áa]bado)|" +
+            "(como|quanto) (que )?(foi|ficou|terminou|tá|ta|está|esta) o (jogo|partida|cl[áa]ssico)|" +
+            "(que horas|quando|que dia) ((é|e|come[çc]a|vai ser) o (jogo|partida|cl[áa]ssico)|joga)|pr[óo]ximo jogo|joga (hoje|amanhã|amanha)|" +
+            "classifica[çc][ãa]o|tabela d[oa] (brasileir\\p{L}*|campeonato|s[ée]rie [a-d]|copa|libertadores|paulist[ãa]o|carioca|" +
+            "premier|liga|champions|(?-i:\\p{Lu})\\p{L}*)|pre[çc]o d[aeo]s?|quanto (custa|custam|vale|valem)|" +
+            // "Quanto tá o dólar", not "quanto tá sua bateria" or "quanto tá faltando pro timer".
+            "quanto (que )?(tá|ta|está|esta) (?!(\\S+ ){0,2}(bateria|volume|brilho|armazenamento|mem[óo]ria|sinal|internet|temperatura|" +
+            "tempo|clima|timer|cron[ôo]metro|alarme|faltando|n[íi]vel))(?!(o |a |os |as )?(meu|minha|seu|sua)\\b)\\p{L}+|" +
+            "cota[çc][ãa]o|c[âa]mbio (d[oa] (d[óo]lar|euro|peso|libra|iene|bitcoin)|hoje|agora)|d[óo]lar hoje|" +
+            "hor[áa]rio de funcionamento|que horas( \\S+){0,4} (abre|fecha|funciona)|" +
+            "(abre|fecha|aberto|aberta|funciona)( \\S+){0,4} (hoje|agora|amanhã|amanha|domingo|sábado|sabado|no feriado)|" +
+            "data de (lançamento|lancamento|estreia)|" +
+            // "Quando sai o filme", not "quando sai meu salário" or "quando começa a reunião".
+            "quando (sai|lan[çc]a|estreia|come[çc]a)(?! (a |o |as |os )?(minha|meu|minhas|meus|nossa|nosso|seu|sua|reuni[ãa]o|consulta|" +
+            "aula|curso|plant[ãa]o|f[ée]rias|sal[áa]rio|pagamento|voo|[ôo]nibus|compromisso|prova|trabalho|expediente|turno)\\b))\\b")
+        // Live questions however they start: the news asked for (not just mentioned, as in "posso te contar
+        // uma notícia?"), a game today, a price or an hour asked back to front.
+        private val LIVE_ALONE_PT = wordRegex("\\b((quais|qual) (são |foram )?(as )?([úu]ltimas )?not[íi]cias|" +
+            "(tem|teve|há|ha|saiu) (alguma |algo de |muita |mais )?not[íi]cias?|" +
+            "me (fala|conta|diz|d[áa]|passa) (as |alguma |umas )?([úu]ltimas )?not[íi]cias|" +
+            "o que (tem|teve|saiu|aconteceu)( \\S+){0,3} (not[íi]cias?|hoje|no mundo)|[úu]ltimas not[íi]cias|manchetes|" +
+            "not[íi]cias (de|do|da|dos|das|sobre) |(voc[êe]|vc) (sabe|viu) (as |alguma |das )?([úu]ltimas )?not[íi]cias|" +
+            "(tem|ter) jogo( \\S+){0,3} (hoje|amanhã|amanha|agora)|hoje tem jogo|" +
+            "(d[óo]lar|euro|gasolina|bitcoin|a[çc][ãa]o|pre[çc]o)( \\S+){0,2} (tá|ta|está|esta) quanto|" +
+            "(abre|fecha|funciona) (at[ée] )?que horas)\\b")
+        // Things to do, which may mention the game or the news: a reminder, an alarm, a message, a call.
+        private val COMMAND_PT = wordRegex("\\b(me lembr\\p{L}*|lembrete|alarme|despertador|timer|cron[ôo]metro|me acord\\p{L}*|" +
+            "manda|mande|envia|envie|fala pr[oa]|diz pr[oa]|pergunta pr[oa]|(liga|ligar|ligue) (pr[oa]|para)|cria|crie|coloca|coloque|" +
+            "anota|anote|toca|toque)\\b")
+        // "Pesquisa…", "busca na internet…", "dá um google no…": the words after are the search. A bare
+        // "busca" is as often "pick up" ("buscar minha mãe no aeroporto"), so it needs somewhere to search.
+        private val SEARCH_REQUEST_PT = wordRegex("^(?:(?:(?:você|voce|vc) )?(?:pode|consegue|poderia|podia) |por favor )*" +
+            "(?:pesquis(?:a|e|ar)|(?:busc|procur)(?:a|e|ar) (?:na internet|no google|na web|online|sobre)|googl(?:a|e|ar)|" +
+            "d[áa] um google(?: n[oa]| sobre)?|joga no google)(?: (?:pra mim|para mim|na internet|no google|na web|online|sobre|por))*" +
+            "\\s+(.+)$")
         // A little life for directions told as they come, when her own retelling isn't to be had.
         private val OPENERS = listOf("Right, bus it is.", "Easy one.", "Here's the plan.", "Got you covered.")
         // Taking or declining an offer she just made, in English or Brazilian Portuguese.

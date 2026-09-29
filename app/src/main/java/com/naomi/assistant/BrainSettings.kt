@@ -4,6 +4,7 @@ import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import java.security.KeyStore
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
@@ -62,10 +63,17 @@ class BrainSettings(context: Context) {
         get() = prefs.getString("custom_base_url", "").orEmpty()
         set(value) = prefs.edit().putString("custom_base_url", value.trim()).apply()
 
-    /** The user's own SearXNG server, for looking things up (see [SearchClient]); blank means DuckDuckGo. */
+    /** The user's own SearXNG server, for looking things up (see [SearchClient]); blank means [pcSearch] or DuckDuckGo. */
     var searchUrl: String
         get() = prefs.getString("search_url", "").orEmpty()
         set(value) = prefs.edit().putString("search_url", value.trim()).apply()
+
+    /**
+     * Where she searches: the SearXNG set above, or — when none is — the one on the PC the Custom
+     * brain runs on (see [pcSearch]). Blank when there's neither: DuckDuckGo from the phone.
+     */
+    val searchServer: String
+        get() = searchUrl.ifBlank { pcSearch(customBaseUrl) }
 
     /** Who Naomi is. Blank means [DEFAULT_PERSONA]. */
     var persona: String
@@ -107,6 +115,19 @@ class BrainSettings(context: Context) {
 
     companion object {
         const val PREFS = "naomi_brain"
+
+        // Where pc/searxng's setup puts SearXNG on the PC's Tailscale name.
+        const val PC_SEARCH_PORT = 8888
+
+        /**
+         * SearXNG on the same Tailscale machine as the brain at [brainUrl] —
+         * "http://pc.tail1234.ts.net:11434/v1" → "http://pc.tail1234.ts.net:8888" — or blank if
+         * the brain isn't on one.
+         */
+        fun pcSearch(brainUrl: String): String {
+            val host = brainUrl.trim().toHttpUrlOrNull()?.host ?: return ""
+            return if (host.endsWith(".ts.net")) "http://$host:$PC_SEARCH_PORT" else ""
+        }
 
         const val DEFAULT_PERSONA =
             "You are Naomi, a personal AI assistant with the poise of J.A.R.V.I.S. and a lot more " +

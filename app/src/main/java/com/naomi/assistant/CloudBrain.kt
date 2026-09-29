@@ -41,6 +41,21 @@ class CloudBrain(private val llm: LlmClient, private val persona: String) {
     /** Her answer from web search results, and whether the results held one. */
     data class Answer(val say: String, val found: Boolean)
 
+    /** How one try at answering from search results went (see [tryAnswer]). */
+    enum class Verdict {
+        /** Answered from the results. */
+        ANSWERED,
+        /** The results don't say: her line saying so is the answer. */
+        NOT_THERE,
+        /** No answer that could be used: unreadable, or stating numbers the results don't have. */
+        UNSURE,
+        /** The brain couldn't be reached. */
+        UNREACHABLE,
+    }
+
+    /** One try at answering from search results: what she'd say (null unless [verdict] is ANSWERED or NOT_THERE), and how it went. */
+    data class Attempt(val answer: Answer?, val verdict: Verdict)
+
     /**
      * One conversational turn. [history] is the recent (user, Naomi) exchanges.
      * Throws [LlmException] when the brain can't be reached.
@@ -49,6 +64,8 @@ class CloudBrain(private val llm: LlmClient, private val persona: String) {
         userText: String,
         history: List<Pair<String, String>>,
         ctx: TurnContext,
+        // False when the turn is going to a web search anyway: its answer is what she'll say.
+        chat: Boolean = true,
     ): Response = withContext(Dispatchers.IO) {
         val now = Date()
         val turns = buildList {
@@ -62,7 +79,7 @@ class CloudBrain(private val llm: LlmClient, private val persona: String) {
         val raw = llm.complete(systemPrompt(persona, ctx, now), turns, REPLY_SCHEMA)
         android.util.Log.d("Naomi", "Cloud reply: $raw")
         val decided = parseReply(raw)
-        if (decided.action != null || !llm.small) return@withContext decided
+        if (decided.action != null || !llm.small || !chat) return@withContext decided
 
         // A small model can't pick actions reliably and sound alive in the same pass: the
         // decision above is sampled cool and reads flat. So it talks in a second, warmer pass
@@ -120,7 +137,8 @@ class CloudBrain(private val llm: LlmClient, private val persona: String) {
     /**
      * What they asked ([userText]) answered from web search [results] for [query], in her voice.
      * Null if the brain can't be reached, or if the answer states a number the results don't
-     * have — a small model fills in a score or a price it half remembers.
+     * have — a small model fills in a score or a price it half remembers. Lively first; if that
+     * strays from the results, once more at a steadier temperature.
      */
     suspend fun answerFrom(
         userText: String,
@@ -128,25 +146,51 @@ class CloudBrain(private val llm: LlmClient, private val persona: String) {
         results: List<SearchClient.Result>,
         history: List<Pair<String, String>>,
         ctx: TurnContext,
-    ): Answer? = withContext(Dispatchers.IO) {
+        pages: List<PageReader.Excerpt> = emptyList(),
+    ): Answer? {
+        for (creative in listOf(true, false)) {
+            val attempt = tryAnswer(userText, query, results, history, ctx, pages, creative)
+            if (attempt.verdict == Verdict.UNREACHABLE) return null
+            attempt.answer?.let { return it }
+        }
+        return null
+    }
+
+    /**
+     * One try at answering [userText] from web search [results] for [query] — and from [pages],
+     * passages read off the top results, when there are any. An answer stating a number neither
+     * has is [Verdict.UNSURE], not an answer.
+     */
+    suspend fun tryAnswer(
+        userText: String,
+        query: String,
+        results: List<SearchClient.Result>,
+        history: List<Pair<String, String>>,
+        ctx: TurnContext,
+        pages: List<PageReader.Excerpt> = emptyList(),
+        creative: Boolean = true,
+    ): Attempt = withContext(Dispatchers.IO) {
         val now = Date()
         // The results come with the question: that's where a small model looks for what to answer from.
-        val turns = plainTurns(history.takeLast(ANSWER_HISTORY), searchTurn(userText, query, results, now))
+        val turns = plainTurns(history.takeLast(ANSWER_HISTORY), searchTurn(userText, query, results, now, pages))
         val source = (results.flatMap { listOfNotNull(it.title, it.snippet, it.published) } +
+            pages.flatMap { listOfNotNull(it.title, it.text, it.published) } +
             listOf(userText, query, searchTurn("", "", emptyList(), now))).joinToString(" ")
-        // Lively first; if that strays from the results, once more at a steadier temperature.
-        for (creative in listOf(true, false)) {
-            val raw = try {
-                llm.complete(answerPrompt(persona, ctx, now), turns, ANSWER_SCHEMA, creative = creative)
-            } catch (e: LlmException) {
-                return@withContext null
-            }
-            android.util.Log.d("Naomi", "Cloud answer: $raw")
-            parseAnswer(raw, known = listOfNotNull(userText, ctx.facts["name"]).joinToString(" "))
-                ?.takeIf { statesOnly(source, it.say) }?.let { return@withContext it }
-            android.util.Log.d("Naomi", "That answer isn't all from the results")
+        val raw = try {
+            llm.complete(answerPrompt(persona, ctx, now), turns, ANSWER_SCHEMA, creative = creative)
+        } catch (e: LlmException) {
+            return@withContext Attempt(null, Verdict.UNREACHABLE)
         }
-        null
+        android.util.Log.d("Naomi", "Cloud answer: $raw")
+        val answer = parseAnswer(raw, known = listOfNotNull(userText, ctx.facts["name"]).joinToString(" "))
+        when {
+            answer == null -> Attempt(null, Verdict.UNSURE)
+            !statesOnly(source, answer.say) -> {
+                android.util.Log.d("Naomi", "That answer isn't all from the results")
+                Attempt(null, Verdict.UNSURE)
+            }
+            else -> Attempt(answer, if (answer.found) Verdict.ANSWERED else Verdict.NOT_THERE)
+        }
     }
 
     /**
@@ -411,7 +455,8 @@ class CloudBrain(private val llm: LlmClient, private val persona: String) {
             appendVoiceAndContext(persona, ctx, now)
             appendLine()
             appendLine("LOOKING THINGS UP")
-            appendLine("You searched the web for what they asked. Their message holds the results, then their question.")
+            appendLine("You searched the web for what they asked. Their message holds the results — and passages from the pages " +
+                "themselves, when you opened them — then their question.")
             appendLine("- \"answer\": what the results say, in a sentence or two, the way you'd tell them. Names, numbers and " +
                 "dates exactly as the results give them, and nothing the results don't say, not even what you think you know.")
             appendLine("- Mind today's date: anything dated before today has already happened, and \"next\" means after today.")
@@ -424,9 +469,16 @@ class CloudBrain(private val llm: LlmClient, private val persona: String) {
 
         /**
          * Their question with what the search found, as the turn she answers — today's date up
-         * front, so "next" and "last year" are read against it.
+         * front, so "next" and "last year" are read against it — and what she read on the pages
+         * themselves ([pages]), if she opened any.
          */
-        fun searchTurn(userText: String, query: String, results: List<SearchClient.Result>, now: Date): String = buildString {
+        fun searchTurn(
+            userText: String,
+            query: String,
+            results: List<SearchClient.Result>,
+            now: Date,
+            pages: List<PageReader.Excerpt> = emptyList(),
+        ): String = buildString {
             // The year spelled out too: a small model given 2026 took "last year" for 2024.
             val year = SimpleDateFormat("yyyy", Locale.ENGLISH).format(now).toInt()
             appendLine("Web results for \"$query\" (today is ${SimpleDateFormat("EEEE d MMMM yyyy", Locale.ENGLISH).format(now)}; " +
@@ -434,6 +486,15 @@ class CloudBrain(private val llm: LlmClient, private val persona: String) {
             results.forEachIndexed { i, r ->
                 val from = listOfNotNull(r.site.ifBlank { null }, r.published).joinToString(", ")
                 appendLine("${i + 1}. ${r.title}${if (from.isEmpty()) "" else " ($from)"}: ${r.snippet}")
+            }
+            if (pages.isNotEmpty()) {
+                appendLine()
+                appendLine("From the pages:")
+                for (page in pages) {
+                    val from = listOfNotNull(page.site.ifBlank { null }, page.published).joinToString(", ")
+                    appendLine("${page.title}${if (from.isEmpty()) "" else " ($from)"}:")
+                    appendLine(page.text)
+                }
             }
             appendLine()
             append("My question: $userText")
@@ -593,8 +654,9 @@ class CloudBrain(private val llm: LlmClient, private val persona: String) {
                 appendLine("- \"look_up\" searches the web and answers from what it finds. Use it for anything current or that " +
                     "changes — news, scores and results, prices, opening hours, release dates, who holds a job now — for facts " +
                     "you're not sure of, and when they say search, google or look up. A follow-up on something looked up (\"when do " +
-                    "they play next?\") is \"look_up\" too. Its \"query\" is a short web search that makes sense on its own: fill " +
-                    "in who or what from the conversation. Timeless knowledge needs no search.")
+                    "they play next?\") is \"look_up\" too. Its \"query\" is a short web search that makes sense on its own, in the " +
+                    "language they asked in: fill in who or what from the conversation and what you know of them (their team, " +
+                    "their city). Timeless knowledge needs no search.")
                 appendLine("- \"web_search\" only opens the search page on the phone, for when they ask to see or open it.")
                 appendLine("- If something essential is missing (who to call, what to say), ask instead of guessing. Never invent contacts.")
                 appendLine("- Keep a message's words exactly as they said them.")
