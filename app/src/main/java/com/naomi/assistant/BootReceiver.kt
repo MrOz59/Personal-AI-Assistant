@@ -9,7 +9,8 @@ import android.content.Context
 import android.content.Intent
 
 /**
- * Re-arms the "Hey Naomi" wake listener after a reboot — but only if the user had it on.
+ * Puts reminders back on the alarm clock after a reboot, and re-arms the "Hey Naomi" wake
+ * listener — but only if the user had it on.
  *
  * Android 14+ blocks starting a microphone foreground service straight from BOOT_COMPLETED
  * (the user isn't present to consent). So we *try* to start it (works on many devices,
@@ -24,6 +25,9 @@ class BootReceiver : BroadcastReceiver() {
             action != "android.intent.action.QUICKBOOT_POWERON" &&
             action != "com.htc.intent.action.QUICKBOOT_POWERON"
         ) return
+
+        // Alarms don't outlive a restart: put the reminders back first, whatever the wake word's doing.
+        ReminderAlarms.rescheduleAll(context)
 
         val wasOn = context.getSharedPreferences("naomi", Context.MODE_PRIVATE)
             .getBoolean("wake", false)
