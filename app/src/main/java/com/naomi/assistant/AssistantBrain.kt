@@ -8,6 +8,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.time.LocalDate
+import java.time.LocalDateTime
 
 /** What Naomi should say back, and whether she should immediately listen again. */
 data class Reply(val text: String, val listenAgain: Boolean = false)
@@ -48,6 +49,11 @@ class AssistantBrain(context: Context) {
     // Work that mustn't hold up a reply: learning from what was said, noting down a finished
     // conversation. Not tied to the screen, so a note started as it closes still gets written.
     private val background = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    init {
+        // Alarms don't outlive an app update or a force stop: put the reminders back on the clock.
+        background.launch { ReminderAlarms.rescheduleAll(appContext) }
+    }
 
     /** Smart mode (UI toggle): the cloud brain may be used. When false, nothing leaves the phone. */
     @Volatile var smartMode = false
@@ -280,7 +286,8 @@ class AssistantBrain(context: Context) {
             android.util.Log.e("Naomi", "Cloud brain failed: ${e.message}")
             return null
         }
-        val action = response.action ?: return missedAction(userText, speaker)?.let { narrated(cloud, userText, it, ctx) } ?: run {
+        val action = response.action ?: return missedReminder(userText, speaker)
+            ?: missedAction(userText, speaker)?.let { narrated(cloud, userText, it, ctx) } ?: run {
             chatTurn = true
             Reply(
                 response.say.ifBlank { "Sorry, I lost my train of thought — say that again?" },
@@ -453,6 +460,19 @@ class AssistantBrain(context: Context) {
         val name = memory.get("name")
         val named = if (name != null) text.replace(Regex("\\b[Tt]he user\\b"), name) else text
         return MemoryBank.pinDates(named.trim(), LocalDate.now())
+    }
+
+    /**
+     * A reminder asked for, looked at or cancelled that the brain answered in words ("Sure, I'll
+     * remind you!") — which sets nothing. Done for real, and said as the phone words it: a
+     * retelling could turn tomorrow into today.
+     */
+    private fun missedReminder(userText: String, speaker: Who): Reply? {
+        if (speaker == Who.GUEST) return null
+        if (!ReminderParser.isRequest(userText) && !ReminderParser.isList(userText) && !ReminderParser.isCancel(userText)) return null
+        val routed = router.tryHandle(userText)
+        if (routed is CommandRouter.Result.NotHandled) return null
+        return resultToReply(routed) { Reply("I couldn't do that.") }
     }
 
     /**
@@ -809,6 +829,12 @@ class AssistantBrain(context: Context) {
             if (cloud() != null) return lookUpReply(query, original)
             return resultToReply(router.executeWebSearch(query)) { Reply("I couldn't open the search.") }
         }
+        // "Remind me to…" filed as something to remember, or as a calendar entry, is still a reminder.
+        if ((type == "remember" || type == "calendar_create") && ReminderParser.isRequest(original)) {
+            return resultToReply(router.reminders.set(original, whenSaid = args.optString("when"))) {
+                Reply("I couldn't set that reminder.")
+            }
+        }
         if (type == "remember") {
             memoryTurn = true
             return Reply(rememberFact(args.optString("fact").ifBlank { REMEMBER.find(original)?.groupValues?.get(1) ?: original }))
@@ -850,7 +876,13 @@ class AssistantBrain(context: Context) {
             "wifi" -> router.executeWifiSettings()
             "bluetooth" -> router.executeBluetooth(args.optString("state", "on") != "off")
             "calendar_read" -> router.executeCalendarRead()
-            "calendar_create" -> router.executeCalendarCreate(args.optString("title"))
+            // A time the user said wins over the model's working out of it, as with timers.
+            "calendar_create" -> router.executeCalendarCreate(args.optString("title"),
+                ReminderParser.parseWhen(original, LocalDateTime.now())?.at ?: ReminderParser.modelTime(args.optString("when"), LocalDateTime.now()),
+                ReminderParser.isPortuguese(original))
+            "reminder" -> router.reminders.set(original, args.optString("text"), args.optString("when"), args.optString("repeat"))
+            "reminders_list" -> router.reminders.list(original)
+            "reminder_cancel" -> router.reminders.cancel(original, args.optString("what"))
             "voice_record_start" -> router.executeStartRecording()
             "voice_record_stop" -> router.executeStopRecording()
             "course_check" -> router.executeCourseCheck()

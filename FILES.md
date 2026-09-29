@@ -8,7 +8,7 @@ A brief map of every source file in `app/src/main/java/com/naomi/assistant/`.
 |------|--------------|
 | `MainActivity.kt` | The whole UI + wiring (Jetpack Compose). Renders the animated orb, the screens (home / memory / settings / brain), the splash animation, and the transcript. Handles mic taps, permissions, wake-word and assistant launch intents, follow-up listening & barge-in, and the "power / back / home → stop everything" reset. |
 | `AssistantBrain.kt` | The orchestrator. Smart mode: every turn goes to the cloud brain (chat or action), falling back offline if it's unreachable. Otherwise: keyword router → on-device Gemma. Manages multi-turn follow-ups, conversation mode, and conversation history — and long-term memory: "remember that…" / "forget…", learning from what the owner says, a note when each conversation ends, and the related memories sent with each turn (never a guest's). |
-| `CommandRouter.kt` | The offline/keyword brain **and** every device action: timers, alarms, time/date, calls, WhatsApp voice/video calls, SMS & WhatsApp messages, music, maps/navigation, rides, food, notes, email, torch, Wi-Fi, Bluetooth, volume, calendar, voice recording, and opening apps/settings. Shared by both the keyword path and the LLM path. |
+| `CommandRouter.kt` | The offline/keyword brain **and** every device action: timers, alarms, time/date, calls, WhatsApp voice/video calls, SMS & WhatsApp messages, music, maps/navigation, rides, food, notes, email, torch, Wi-Fi, Bluetooth, volume, calendar (reading it, and adding events at the time said), reminders, voice recording, and opening apps/settings. Shared by both the keyword path and the LLM path. |
 
 ## Ears & mouth
 
@@ -44,7 +44,12 @@ A brief map of every source file in `app/src/main/java/com/naomi/assistant/`.
 | `DeviceLocation.kt` | The phone's location and neighbourhood name (fused location + geocoder), cached for a few minutes. |
 | `VoiceRecorder.kt` | In-app voice memo recorder — saves M4A files to public storage via MediaStore. |
 | `WhatsAppSender.kt` | Accessibility service. Auto-taps WhatsApp's Send button after Naomi opens a chat, and provides general on-screen control (tap / scroll / type by voice) for other apps. |
-| `BootReceiver.kt` | Re-arms the wake listener after a reboot, if the user had it enabled. |
+| `ReminderParser.kt` | Reading a reminder out of what was said, in English or Portuguese: what it's about, and when ("tomorrow at 9", "in 20 minutes", "na sexta às 3 da tarde", "every weekday at 7:30", "todo dia 10"). An hour said without AM/PM is the next one that makes sense. Also tells a list or cancel request from a new reminder. |
+| `ReminderStore.kt` | Reminders that are set (`naomi_reminders.json`), soonest first, with repeats (daily, weekdays, weekly, monthly) moved on to their next time once they go off; finds the one meant by a few of its words. |
+| `ReminderCommands.kt` | Setting, listing and cancelling reminders by voice — asking what or when when either was left out. |
+| `ReminderReceiver.kt` | Schedules each reminder as an exact alarm, and when one goes off shows a notification (snooze 10 min / done) and says it out loud unless the phone is silenced, in a call or on Do Not Disturb. Re-arms them all after an update. |
+| `ReminderText.kt` | Everything she says about reminders and new calendar events, in the language they were asked in ("tomorrow at 9:00 AM", "amanhã às 9:00"). |
+| `BootReceiver.kt` | Re-arms reminders after a reboot, and the wake listener if the user had it enabled. |
 
 ## Voice verification (per-user wake)
 

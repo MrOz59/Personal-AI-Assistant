@@ -582,6 +582,12 @@ class CloudBrain(private val llm: LlmClient, private val persona: String) {
                     "\"drive\" by car, \"transit\" by bus, train or ferry, else empty. A follow-up like \"and walking?\" or " +
                     "\"how do I get there?\" is about the place just discussed — leave \"destination\" empty.")
                 appendLine("- \"Remember that…\" is \"remember\" (the fact as a short sentence about them); \"forget…\" is \"forget\".")
+                appendLine("- \"Remind me…\" is \"reminder\" — not \"remember\", not the calendar. \"text\" is what to remind them of, " +
+                    "in their words. \"when\" is the exact local date and time it goes off, worked out from the date and time above " +
+                    "(\"in 20 minutes\", \"tomorrow at 9\", \"on Friday\"), or empty if they didn't say when — she'll ask. \"repeat\" " +
+                    "is none unless they said every day, weekdays, every week or every month. \"What are my reminders?\" is " +
+                    "\"reminders_list\"; cancelling one is \"reminder_cancel\".")
+                appendLine("- An event or appointment for their calendar is \"calendar_create\", its \"when\" worked out the same way.")
                 appendLine("- Only act when they actually ask. Talking about calling someone is not a request to call; questions and chat need no action.")
                 appendLine("- Live information — weather, battery, their calendar — only ever comes from its action. Never guess it.")
                 appendLine("- \"look_up\" searches the web and answers from what it finds. Use it for anything current or that " +
@@ -602,6 +608,10 @@ class CloudBrain(private val llm: LlmClient, private val persona: String) {
                 appendLine()
                 appendLine("EXAMPLES")
                 EXAMPLES.forEach { (user, reply) -> appendLine("\"$user\" → $reply") }
+                // Dated from today, so a model that copies it still has the right day.
+                val tomorrow = SimpleDateFormat("yyyy-MM-dd", Locale.ENGLISH).format(Date(now.time + 86_400_000L))
+                appendLine("\"remind me to call the dentist tomorrow at 9\" → {\"action\": {\"type\":\"reminder\",\"text\":\"call the dentist\"," +
+                    "\"when\":\"$tomorrow 09:00\",\"repeat\":\"none\"}, \"say\": \"\"}")
             }.trimEnd()
         }
 
@@ -665,7 +675,11 @@ class CloudBrain(private val llm: LlmClient, private val persona: String) {
             Action("wifi"),
             Action("bluetooth", Field("state", "<on|off>")),
             Action("calendar_read"),
-            Action("calendar_create", Field("title", "<text>")),
+            Action("calendar_create", Field("title", "<text>"), Field("when", "<yyyy-MM-dd HH:mm, or empty>")),
+            Action("reminder", Field("text", "<what to remind them of, in their words>"),
+                Field("when", "<yyyy-MM-dd HH:mm, or empty if they didn't say>"), Field("repeat", "<none|daily|weekdays|weekly|monthly>")),
+            Action("reminders_list"),
+            Action("reminder_cancel", Field("what", "<which one, in their words, or empty for the last one>")),
             Action("voice_record_start"),
             Action("voice_record_stop"),
             Action("remember", Field("fact", "<the fact, as a short sentence about them>")),
