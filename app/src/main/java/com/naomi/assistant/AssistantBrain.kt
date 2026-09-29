@@ -38,6 +38,8 @@ class AssistantBrain(context: Context) {
     private val localBrain = LocalBrain(context.applicationContext)
     private val weather = WeatherClient()
     private val distance = DistanceClient(context.applicationContext)
+    private val transit = TransitClient()
+    private val search = SearchClient()
     val memory = MemoryStore(context.applicationContext)
     /** What she's learned about the owner, and notes on past conversations. */
     val memories = MemoryBank.get(context.applicationContext)
@@ -49,6 +51,9 @@ class AssistantBrain(context: Context) {
 
     /** Smart mode (UI toggle): the cloud brain may be used. When false, nothing leaves the phone. */
     @Volatile var smartMode = false
+
+    /** Says a line while she works on a slow answer ("Let me check."), ahead of the reply. Set by the screen. */
+    var onAside: ((String) -> Unit)? = null
 
     // A follow-up awaiting the user's next reply (e.g. choosing the messaging app).
     private var pending: ((String) -> CommandRouter.Result)? = null
@@ -64,6 +69,22 @@ class AssistantBrain(context: Context) {
     private var talked = false
     private var chatTurn = false
     private var lastTurnAt = 0L
+
+    // The place the last distance answer was about — "and on foot?" asks about it again.
+    private var lastPlace: DistanceClient.Found? = null
+    // An offer she just made ("Want me to open the route in Maps?"): a yes takes it, a no drops
+    // it, and anything else drops it and is handled as a new request.
+    private var offer: (() -> CommandRouter.Result)? = null
+    // What the cloud brain was told this turn, for retelling a result in her voice from inside an
+    // action (directions); null offline.
+    private var turnCtx: TurnContext? = null
+    // The recognizer's other guesses at this turn's words.
+    private var heardAs: List<String> = emptyList()
+    // Contact names, looked up now and then for the recognizer's vocabulary.
+    private var contactNames: List<String> = emptyList()
+    private var contactNamesAt = 0L
+    // Set by a turn that was an explicit "remember that…"/"forget…": nothing more to learn from it.
+    private var memoryTurn = false
 
     // What was learned last, and when: "forget that" right after means these.
     @Volatile private var lastLearned: List<Long> = emptyList()
@@ -86,7 +107,12 @@ class AssistantBrain(context: Context) {
      * Public entry point. Runs the turn, then decides whether Naomi's reply is a question that
      * should reopen the mic, and records the exchange so the next turn has conversational context.
      */
-    suspend fun handle(userText: String, speaker: Who = Who.UNKNOWN): Reply {
+    suspend fun handle(heard: String, speaker: Who = Who.UNKNOWN, alternatives: List<String> = emptyList()): Reply {
+        // The recognizer's runner-up is sometimes the right one: the names it has that she knows
+        // settle it ("closest work" / "closest Woolworths", with Woolworths just talked about).
+        val userText = alternatives.firstOrNull { knownNamesIn(it) > knownNamesIn(heard) } ?: heard
+        val heardAs = if (userText == heard) alternatives else listOf(heard) + (alternatives - userText)
+        if (userText != heard) android.util.Log.i("Naomi", "Took the recognizer's other guess: \"$userText\" over \"$heard\"")
         val now = System.currentTimeMillis()
         // A long pause ends a conversation: it gets noted down, and the next one starts fresh.
         if (history.isNotEmpty() && now - lastTurnAt > CONVERSATION_GAP_MS) cancel()
@@ -94,6 +120,9 @@ class AssistantBrain(context: Context) {
         memories.ownerName = memory.get("name")
         val herLastLine = history.lastOrNull()?.second
         chatTurn = false
+        memoryTurn = false
+        turnCtx = null
+        this.heardAs = heardAs
 
         val reply = handleInternal(userText, speaker)
 
@@ -119,10 +148,10 @@ class AssistantBrain(context: Context) {
         if (speaker != Who.GUEST) {
             conversation.addLast(userText to reply.text)
             while (conversation.size > MAX_NOTED_TURNS) conversation.removeFirst()
-            if (chatTurn) {
-                talked = true
-                learnFrom(userText, herLastLine)
-            }
+            if (chatTurn) talked = true
+            // What they say about themselves counts even when it comes with a request ("I don't
+            // have a car, so how far is it on foot?") — only not twice, after "remember that…".
+            if (!memoryTurn) learnFrom(userText, herLastLine)
         }
 
         return reply.copy(listenAgain = question || reply.listenAgain)
@@ -133,12 +162,12 @@ class AssistantBrain(context: Context) {
 
     /** Actions whose report is worth hearing in her own voice. The rest hand the screen to another
      *  app (a call, the map, music) or ask a follow-up, and are left as the phone says them. */
-    private val NARRATED = setOf("weather", "battery", "calendar_read", "distance", "set_timer", "set_alarm", "flashlight")
+    private val NARRATED = setOf("weather", "battery", "calendar_read", "distance", "nearest", "set_timer", "set_alarm", "flashlight")
 
     /** What a guest may ask for. Anything personal — calls, messages, calendar, notes, apps,
      *  rides, orders — stays the owner's. */
     private val GUEST_ACTIONS = setOf("weather", "battery", "set_timer", "flashlight", "play_music", "music_control",
-        "distance", "maps_search", "web_search")
+        "distance", "nearest", "directions", "maps_search", "web_search", "look_up")
 
     private fun ownerName(): String = memory.get("name") ?: "my owner"
 
@@ -174,10 +203,13 @@ class AssistantBrain(context: Context) {
             return resultToReply(result) { reset(); Reply("Okay, never mind.") }
         }
 
-        // Explicit memory requests are handled on the phone, the same with or without the cloud.
-        if (!guest) memoryCommand(userText)?.let { return it }
-
         val lower = userText.lowercase()
+
+        offer?.let { take ->
+            offer = null
+            if (NO_TO_OFFER.containsMatchIn(lower)) return Reply("No problem.")
+            if (YES_TO_OFFER.containsMatchIn(lower)) return resultToReply(take()) { Reply("I couldn't open that.") }
+        }
 
         // 0. DAILY BRIEFING: greeting + date + weather + today's calendar, in one go (owner only).
         if (!guest && Regex("\\b(good morning|morning briefing|brief me|briefing|start my day|how'?s my day|what'?s my day|the rundown|catch me up)\\b")
@@ -185,11 +217,16 @@ class AssistantBrain(context: Context) {
             return Reply(dailyBriefing())
         }
 
-        // 1. SMART MODE: the cloud brain understands the whole turn — chat or action.
+        // 1. SMART MODE: the cloud brain understands the whole turn — chat or action. "Remember
+        // that…" and "forget…" go to it too: out of context, "remember the Woolworths we talked
+        // about? how do I get there" reads like a thing to keep.
         cloud()?.let { cloud ->
             cloudTurn(cloud, userText, speaker)?.let { return it }
             // The cloud couldn't be reached: handle it offline below.
         }
+
+        // Offline, memory requests are recognized by their wording.
+        if (!guest) memoryCommand(userText)?.let { return it }
 
         // 2a. WEATHER: needs a live network lookup (async), so it can't live in the sync router.
         if (Regex("\\b(weather|temperature|forecast)\\b").containsMatchIn(lower)) {
@@ -233,7 +270,9 @@ class AssistantBrain(context: Context) {
             where = DeviceLocation.current(appContext)?.name,
             speaker = speaker,
             memories = recall(userText, speaker),
+            heardAs = heardAs,
         )
+        turnCtx = ctx
         val response = try {
             cloud.respond(userText, history.toList(), ctx)
         } catch (e: LlmException) {
@@ -303,9 +342,11 @@ class AssistantBrain(context: Context) {
         val text = userText.trim().replace(LEADING_NAME, "")
         REMEMBER.find(text)?.let { m ->
             val said = m.groupValues[1].trim().trimEnd('.', '!', '?')
-            return if (said.split(Regex("\\s+")).size < 2) null else Reply(rememberFact(said))
+            if (said.split(Regex("\\s+")).size < 2) return null
+            memoryTurn = true
+            return Reply(rememberFact(said))
         }
-        FORGET.find(text)?.let { m -> return forgetReply(m.groupValues[1], fromModel = false) }
+        FORGET.find(text)?.let { m -> return forgetReply(m.groupValues[1], fromModel = false)?.also { memoryTurn = true } }
         return null
     }
 
@@ -435,12 +476,28 @@ class AssistantBrain(context: Context) {
         }
         if (asksDistance(lower)) {
             Regex("\\b(?:from|to)\\s+(.+)$").findAll(lower).lastOrNull()?.let { m ->
-                return Reply(distanceReport(m.groupValues[1].replace(Regex("[?.!]+$"), "").trim()))
+                return Reply(distanceReport(m.groupValues[1].replace(Regex("[?.!]+$"), "").trim(), travelFor("", userText)))
+            }
+        }
+        // "How do I get there by bus?" answered with words: work out the way.
+        if (Regex("\\bhow (do|can|could|would|should) (i|we) get (to|there)\\b|\\b(which|what) (bus|train|ferry)\\b").containsMatchIn(lower)) {
+            val to = Regex("\\bget to\\s+(.+?)(?:\\s+(?:by|on|via)\\s+.+)?$").find(lower)?.groupValues?.get(1)?.trim('?', '.', '!', ' ')
+            return directionsReply(to.orEmpty(), saidTravel("", userText), userText)
+        }
+        // "Where's the closest Woolworths?" answered with words: look it up.
+        if (asksNearest(lower)) {
+            Regex("\\b(?:closest|nearest)\\s+(.+)$").find(lower)?.let { m ->
+                return Reply(nearestReport(m.groupValues[1].replace(Regex("[?.!]+$"), "").trim(), travelFor("", userText)))
             }
         }
         if (!guest && Regex("\\b(text|message|whatsapp|sms|dm)\\b.+\\b(that|saying|to say)\\b").containsMatchIn(lower)) {
             val routed = router.tryHandle(userText)
             if (routed !is CommandRouter.Result.NotHandled) return resultToReply(routed) { Reply("I couldn't do that.") }
+        }
+        // "Who won last night?", "google the cricket score": looked up, never answered from a model's memory.
+        val bare = lower.replace(LEADING_NAME, "").trim()
+        if ((QUESTION_START.containsMatchIn(bare) && LIVE_QUESTION.containsMatchIn(bare)) || SEARCH_REQUEST.containsMatchIn(bare)) {
+            return lookUpReply(searchQuery(userText), userText)
         }
         return null
     }
@@ -476,6 +533,12 @@ class AssistantBrain(context: Context) {
 
     private fun homeCity(): String? = memory.get("city") ?: memory.get("home city") ?: memory.get("home")
 
+    private fun asksNearest(text: String): Boolean {
+        val lower = text.lowercase()
+        return Regex("\\b(closest|nearest)\\b").containsMatchIn(lower) &&
+            !Regex("\\b(map|maps|show|navigate|directions|take me)\\b").containsMatchIn(lower)
+    }
+
     private fun asksDistance(lower: String): Boolean =
         Regex("\\b(how far|distance (to|from)|how long (does it take |would it take |will it take )?to (get|drive))\\b").containsMatchIn(lower)
 
@@ -483,14 +546,205 @@ class AssistantBrain(context: Context) {
      * How far the phone is from [destination], by road when possible. A name the speech
      * recognizer mangled ("Wooster") gets one retry through the brain, which knows the area.
      */
-    private suspend fun distanceReport(destination: String): String {
+    private suspend fun distanceReport(destination: String, travel: DistanceClient.Travel? = null): String {
+        // "How far is it on foot?" — the place just talked about, not a new search.
+        lastPlace?.takeIf { refersTo(destination, it) }?.let { place ->
+            val here = DeviceLocation.current(appContext)
+                ?: return "I can't tell where you are right now. Is location turned on?"
+            return distance.describe(here, place, travel)
+        }
         if (destination.isBlank()) return "Where to?"
+        // "The closest bus stop" is a kind of place to look for, not a place's name.
+        nearestKind(destination)?.let { return nearestReport(it, travel) }
         val here = DeviceLocation.current(appContext)
             ?: return "I can't tell where you are right now. Is location turned on?"
-        val found = distance.locate(destination, here)
-            ?: cloud()?.resolvePlace(destination, here.name)?.let { distance.locate(it, here) }
-            ?: return "I couldn't find anywhere called $destination."
-        return distance.describe(here, found)
+        val target = cleanDestination(destination, here.name)
+        val found = distance.locate(target, here)
+            ?: cloud()?.resolvePlace(target, here.name)?.let { distance.locate(it, here) }
+            ?: return "I couldn't find anywhere called $target."
+        lastPlace = found
+        return distance.describe(here, found, travel)
+    }
+
+    /**
+     * "How do I get to X (by bus)?" — the way there in words: the bus or train to catch and when,
+     * by public transport; how far and how long on foot or by car. Then she offers to open the
+     * route in Maps, and waits for the answer.
+     */
+    private suspend fun directionsReply(destination: String, said: DistanceClient.Travel?, asked: String): Reply {
+        val here = DeviceLocation.current(appContext)
+            ?: return Reply("I can't tell where you are right now. Is location turned on?")
+        val place = lastPlace?.takeIf { refersTo(destination, it) }
+            ?: nearestKind(destination)?.let { distance.nearest(DistanceClient.kindOf(it), here) }
+            ?: destination.takeIf { it.isNotBlank() }?.let { distance.locate(cleanDestination(it, here.name), here) }
+            ?: return Reply(if (destination.isBlank()) "Where to?" else "I couldn't find anywhere called $destination.")
+        lastPlace = place
+        val km = FloatArray(1).also { android.location.Location.distanceBetween(here.lat, here.lon, place.lat, place.lon, it) }[0] / 1000.0
+        // Unsaid: walk if it's close; if not, the bus for someone without a car, else the car.
+        val travel = said ?: when {
+            km < 1.5 -> DistanceClient.Travel.WALK
+            noCar() -> DistanceClient.Travel.TRANSIT
+            else -> DistanceClient.Travel.DRIVE
+        }
+        val trip = if (travel == DistanceClient.Travel.TRANSIT) transit.plan(here, place.lat, place.lon) else null
+        val way = when {
+            trip != null -> TransitClient.spoken(trip, place.name)
+            travel == DistanceClient.Travel.TRANSIT ->
+                "I couldn't find a bus or train there right now. " + distance.describe(here, place, DistanceClient.Travel.WALK)
+            else -> distance.describe(here, place, travel)
+        }
+        // Her voice around the way there, which is read out as worked out: a retelling could turn
+        // the bus's departure into the arrival time. On foot or by car, a plain retelling will do.
+        val cloud = turnCtx?.let { ctx -> cloud()?.let { it to ctx } }
+        val told = if (trip != null) {
+            val (before, after) = cloud?.let { (brain, ctx) -> brain.frame(asked, way, history.toList(), ctx) } ?: (null to null)
+            listOfNotNull(before ?: OPENERS.random(), way, after).joinToString(" ")
+        } else {
+            cloud?.let { (brain, ctx) -> brain.narrate(asked, way, history.toList(), ctx) } ?: way
+        }
+        offer = { router.executeDirections(place.lat, place.lon, mapsMode(travel)) }
+        return Reply("$told Want me to open the route in Maps?", listenAgain = true)
+    }
+
+    private fun mapsMode(travel: DistanceClient.Travel) = when (travel) {
+        DistanceClient.Travel.TRANSIT -> "transit"
+        DistanceClient.Travel.WALK -> "walking"
+        DistanceClient.Travel.DRIVE -> "driving"
+    }
+
+    /**
+     * [query] looked up on the web and [asked] answered from what came back, in her voice.
+     * Results that don't answer it, or no results at all, end with the offer to open the search
+     * on the phone.
+     */
+    private suspend fun lookUpReply(query: String, asked: String): Reply {
+        onAside?.invoke(LOOKING.random())
+        val found = search.search(query, settings.searchUrl, VoiceInput.englishHere(appContext))
+        val openSearch = { router.executeWebSearch(query) }
+        if (found == null) {
+            offer = openSearch
+            return Reply("I couldn't get any search results just now. Want me to open the search on your phone?", listenAgain = true)
+        }
+        android.util.Log.i("Naomi", "Looked up \"$query\" on ${found.source}: ${found.results.size} results")
+        val answer = turnCtx?.let { ctx -> cloud()?.answerFrom(asked, query, found.results, history.toList(), ctx) }
+        if (answer != null && answer.found) {
+            return Reply(answer.say, listenAgain = settings.conversationMode && !isGoodbye(asked))
+        }
+        // No answer in the results, or none she could word without making things up: the top
+        // snippet is as likely a page's footnotes as the answer, so it isn't read out instead.
+        offer = openSearch
+        val said = answer?.say ?: "I found a few pages, but couldn't pin down a clear answer."
+        return Reply("$said Want me to open the search?", listenAgain = true)
+    }
+
+    /** What to search for when all there is to go on is what they said: "google the cricket score" → "the cricket score". */
+    private fun searchQuery(said: String): String =
+        SEARCH_REQUEST.find(said.replace(LEADING_NAME, "").trim())?.groupValues?.get(1)?.trim('?', '.', '!', ' ') ?: said.trim('?', '.', '!', ' ')
+
+    /**
+     * Words the recognizer should listen out for: her name, the owner's, people and places in her
+     * memory and facts, the place just talked about, contacts. Names are what it gets wrong most.
+     */
+    fun vocabulary(): List<String> {
+        val words = linkedSetOf("Naomi")
+        words += knownNames()
+        val now = System.currentTimeMillis()
+        if (now - contactNamesAt > CONTACTS_TTL_MS) {
+            contactNames = runCatching { router.getAllContactNames() }.getOrDefault(emptyList()).take(MAX_CONTACT_WORDS)
+            contactNamesAt = now
+        }
+        words += contactNames
+        return words.filter { it.isNotBlank() }.take(MAX_VOCABULARY)
+    }
+
+    /**
+     * Names she knows right now: the owner's, people and places in her facts and memories, the
+     * place just talked about, and names in the last few lines of the conversation.
+     */
+    private fun knownNames(): Set<String> {
+        val names = linkedSetOf<String>()
+        fun capitalised(text: String) = Regex("\\b[A-Z][a-zA-Z']{2,}").findAll(text).map { it.value.removeSuffix("'s") }
+            .filterNot { it.lowercase() in NOT_NAMES }
+        memory.all().forEach { (key, value) -> if (key == "name" || value.firstOrNull()?.isUpperCase() == true) names += value }
+        lastPlace?.let { names += capitalised(it.name) }
+        memories.all().forEach { names += capitalised(it.text) }
+        history.takeLast(3).forEach { (user, naomi) -> names += capitalised(user); names += capitalised(naomi) }
+        return names
+    }
+
+    /** How many of the names she knows [text] mentions. */
+    private fun knownNamesIn(text: String): Int {
+        val lower = text.lowercase()
+        return knownNames().count { Regex("\\b${Regex.escape(it.lowercase())}\\b").containsMatchIn(lower) }
+    }
+
+    /** Whether [said] means [place]: "it", "there" — or mostly the words of its name. */
+    private fun refersTo(said: String, place: DistanceClient.Found): Boolean {
+        val t = said.lowercase().trim().trimEnd('?', '.', '!')
+        if (t.isEmpty() || t in PLACE_PRONOUNS) return true
+        val name = memories.terms(place.name)
+        val words = memories.terms(t)
+        return name.isNotEmpty() && name.count { n -> words.any { MemoryBank.similar(n, it) } } * 2 >= name.size
+    }
+
+    /** A place name without the trip around it: "Woolworths walking distance from Frenchs Forest" → "Woolworths". */
+    private fun cleanDestination(said: String, here: String?): String {
+        var t = said.replace(Regex("\\b(walking|driving) (distance|time)\\b|\\b(on|by) (foot|walking|car)\\b|" +
+            "\\bfrom (here|my (place|home|house))\\b", RegexOption.IGNORE_CASE), " ")
+        if (!here.isNullOrBlank()) t = t.replace(Regex("\\bfrom\\s+${Regex.escape(here)}\\b", RegexOption.IGNORE_CASE), " ")
+        return t.replace(Regex("\\s+"), " ").trim().ifBlank { said.trim() }
+    }
+
+    /**
+     * How they mean to get there: as the model took it, else as they said it ("on foot", "I
+     * don't have a car", "by car"), else on foot if they've told her they don't drive — else
+     * null, left to the distance.
+     */
+    private fun travelFor(mode: String, said: String): DistanceClient.Travel? =
+        saidTravel(mode, said) ?: if (noCar()) DistanceClient.Travel.WALK else null
+
+    /** How they asked to get there — by the model's reading, else their words — or null if they didn't say. */
+    private fun saidTravel(mode: String, said: String): DistanceClient.Travel? {
+        val m = mode.lowercase().trim()
+        val s = said.lowercase()
+        return when {
+            m.startsWith("walk") || m == "foot" -> DistanceClient.Travel.WALK
+            m.startsWith("driv") || m == "car" -> DistanceClient.Travel.DRIVE
+            m in setOf("transit", "bus", "train", "public", "public transport") -> DistanceClient.Travel.TRANSIT
+            TRANSIT_WORDS.containsMatchIn(s) -> DistanceClient.Travel.TRANSIT
+            Regex("\\b(walk|walking|on foot|by foot)\\b").containsMatchIn(s) || NO_CAR.containsMatchIn(s) -> DistanceClient.Travel.WALK
+            Regex("\\b(drive|driving|by car)\\b").containsMatchIn(s) -> DistanceClient.Travel.DRIVE
+            else -> null
+        }
+    }
+
+    /** Whether they've told her they don't drive — kept as a memory. */
+    private fun noCar(): Boolean = memories.all().any { it.kind == MemoryBank.Kind.FACT && NO_CAR.containsMatchIn(it.text) }
+
+    /**
+     * Where the nearest [what] is and how far — a kind of place ("bus stop") or a chain
+     * ("Woolworths") — found around the phone in OpenStreetMap.
+     */
+    private suspend fun nearestReport(what: String, travel: DistanceClient.Travel? = null): String {
+        if (DistanceClient.kindOf(what).isBlank()) return "The nearest what?"
+        val here = DeviceLocation.current(appContext)
+            ?: return "I can't tell where you are right now. Is location turned on?"
+        // The search is already around the phone: "Woolworths Frenchs Forest", "a cafe near Manly"
+        // would only narrow it to places named that way.
+        val kind = DistanceClient.kindOf(what)
+            .replace(Regex("\\s+(?:in|near|around|at|close to)\\s+.+$", RegexOption.IGNORE_CASE), "")
+            .let { k -> here.name?.takeIf { it.isNotBlank() }?.let { k.replace(it, "", ignoreCase = true) } ?: k }
+            .trim().ifBlank { DistanceClient.kindOf(what) }
+        val found = distance.nearest(kind, here) ?: return "I couldn't find a $kind anywhere near you."
+        lastPlace = found
+        return distance.describeNearest(here, found, kind, travel)
+    }
+
+    /** The kind of place in "the closest bus stop" / "a pharmacy near me", or null for a named place. */
+    private fun nearestKind(text: String): String? {
+        val t = text.trim().trimEnd('?', '.', '!')
+        return Regex("^(?:the\\s+|a\\s+|an\\s+)?(?:closest|nearest)\\s+(.+)$", RegexOption.IGNORE_CASE).find(t)?.groupValues?.get(1)
+            ?: Regex("^(?:the\\s+|a\\s+|an\\s+)?(.+?)\\s+(?:near me|nearby|around here|close by)$", RegexOption.IGNORE_CASE).find(t)?.groupValues?.get(1)
     }
 
     /**
@@ -518,14 +772,50 @@ class AssistantBrain(context: Context) {
      * the phone's report of what actually happened.
      */
     private suspend fun dispatch(type: String, args: JSONObject, original: String, say: String): Reply {
+        val travel = travelFor(args.optString("mode"), original)
+        // A bus stop or station is where transit starts, not how to reach it.
+        val saidTravel = saidTravel(args.optString("mode"), original).takeUnless {
+            it == DistanceClient.Travel.TRANSIT && type == "nearest" &&
+                Regex("\\b(stop|station|wharf|terminal)\\b", RegexOption.IGNORE_CASE).containsMatchIn(args.optString("what"))
+        }
+        // The way there — explained, then offered on the map. "How far by bus" is the way there too.
+        if (type == "directions" || (type in setOf("distance", "nearest") && saidTravel == DistanceClient.Travel.TRANSIT)) {
+            val where = args.optString("destination").ifBlank { args.optString("what") }
+                .let { if (type == "nearest" && nearestKind(it) == null) "the nearest $it" else it }
+            return directionsReply(where, saidTravel, original)
+        }
+        // "Take me there": the place just talked about, if that's what "there" is.
+        if (type == "navigate") {
+            lastPlace?.takeIf { refersTo(args.optString("destination"), it) }?.let { place ->
+                return resultToReply(router.executeDirections(place.lat, place.lon, mapsMode(travel ?: DistanceClient.Travel.DRIVE))) {
+                    Reply("I couldn't open Maps.")
+                }
+            }
+        }
+        if (type == "nearest") return Reply(join(say, nearestReport(args.optString("what").ifBlank { args.optString("query") }, travel)))
         // "How far is X" is a question, not a trip — even when a model reaches for the map.
         if (type == "distance" || (type in setOf("navigate", "maps_search") && asksDistance(original.lowercase()))) {
-            return Reply(join(say, distanceReport(args.optString("destination").ifBlank { args.optString("query") })))
+            return Reply(join(say, distanceReport(args.optString("destination").ifBlank { args.optString("query") }, travel)))
+        }
+        // "Where's the closest Woolworths?" wants an answer, not the map — unless the map was asked for.
+        if (type == "maps_search" && asksNearest(original)) {
+            return Reply(join(say, nearestReport(nearestKind(args.optString("query")) ?: args.optString("query"), travel)))
+        }
+        // Looked up and answered, not just opened — unless they asked to see the search page.
+        // Offline, with nothing to word an answer, the page it is.
+        if (type == "look_up" || (type == "web_search" && !ASKS_TO_OPEN.containsMatchIn(original))) {
+            val query = args.optString("query").ifBlank { searchQuery(original) }
+            if (cloud() != null) return lookUpReply(query, original)
+            return resultToReply(router.executeWebSearch(query)) { Reply("I couldn't open the search.") }
         }
         if (type == "remember") {
+            memoryTurn = true
             return Reply(rememberFact(args.optString("fact").ifBlank { REMEMBER.find(original)?.groupValues?.get(1) ?: original }))
         }
-        if (type == "forget") return forgetReply(args.optString("what"), fromModel = true) ?: Reply("Okay.")
+        if (type == "forget") {
+            memoryTurn = true
+            return forgetReply(args.optString("what"), fromModel = true) ?: Reply("Okay.")
+        }
         if (type == "weather") {
             // A day the user actually said wins over the model's reading of it.
             val day = WeatherClient.dayOffset(original).takeIf { it != 0 } ?: WeatherClient.dayOffset(args.optString("day"))
@@ -610,7 +900,7 @@ class AssistantBrain(context: Context) {
     /** Full conversational reset — drop any pending follow-up AND the conversation history.
      *  Called when the user backs out / leaves, so the next turn starts fresh. The conversation
      *  that ends here is noted down first. */
-    fun cancel() { reset(); followUpStreak = 0; history.clear(); noteConversation() }
+    fun cancel() { reset(); followUpStreak = 0; history.clear(); lastPlace = null; offer = null; noteConversation() }
 
     companion object {
         // A pause this long ends a conversation: it's noted down, and the next one starts fresh.
@@ -644,6 +934,44 @@ class AssistantBrain(context: Context) {
         )
         private val RECALL = Regex("\\b(do you remember|what do you (know|remember)|what did i (tell|say to) you)\\b", RegexOption.IGNORE_CASE)
         private val FIRST_PERSON_START = Regex("^(i|i'm|i've|i'd|i'll|my|me)\\b", RegexOption.IGNORE_CASE)
+        // Going by public transport: "by bus", "take the train", "which bus" — not "the bus stop".
+        private val TRANSIT_WORDS = Regex("\\b(by|on|via|take|taking|catch|catching|get|getting)\\s+(a\\s+|the\\s+)?" +
+            "(bus|buses|train|trains|ferry|tram|light rail|metro)\\b|\\bpublic transport\\b|\\b(which|what)\\s+(bus|train|ferry)\\b",
+            RegexOption.IGNORE_CASE)
+        // "I don't have a car", "Ozzy doesn't drive", "no car" — getting around on foot.
+        private val NO_CAR = Regex("\\b(don'?t|doesn'?t|do not|does not|no longer) (have|own) a car\\b|\\bno car\\b|" +
+            "\\bwithout a car\\b|\\b(can'?t|cannot|don'?t|doesn'?t|do not|does not) drive\\b", RegexOption.IGNORE_CASE)
+        // The recognizer's word list: contact names looked up at most this often, and how many words in all.
+        private const val CONTACTS_TTL_MS = 10 * 60_000L
+        private const val MAX_CONTACT_WORDS = 60
+        private const val MAX_VOCABULARY = 100
+        private val NOT_NAMES = setOf("the", "this", "that", "they", "their", "she", "her", "his", "him", "it", "on", "in",
+            "at", "and", "but", "when", "yesterday", "today", "earlier", "tomorrow", "note", "naomi", "monday", "tuesday",
+            "wednesday", "thursday", "friday", "saturday", "sunday", "january", "february", "march", "april", "may", "june",
+            "july", "august", "september", "october", "november", "december")
+        // What she says as she starts looking something up, so the wait isn't silent.
+        private val LOOKING = listOf("Let me check.", "One sec, I'll look it up.", "Hang on, let me look.", "Checking now.")
+        // "Search for…", "google…", "look up…": the words after are the search.
+        private val SEARCH_REQUEST = Regex("^(?:(?:can|could|would|will) you |please )*(?:search(?: the web| online| google)?" +
+            "(?: for)?|google|look up|find out)\\s+(.+)$", RegexOption.IGNORE_CASE)
+        // Asking to see the search, not to be told: "open google and search…", "show me results for…".
+        private val ASKS_TO_OPEN = Regex("\\b(open|show me|pull up|bring up|browser|chrome)\\b", RegexOption.IGNORE_CASE)
+        // A question, by how it starts — the recognizer doesn't always add the question mark.
+        private val QUESTION_START = Regex("^(who|what|what's|whats|when|where|which|how|is|are|was|were|did|does|do|will|can you tell|tell me)\\b",
+            RegexOption.IGNORE_CASE)
+        // Questions only something current can answer.
+        private val LIVE_QUESTION = Regex("\\b(who won|who'?s winning|score|scores|latest|news|headlines|price of|stock price|" +
+            "exchange rate|opening hours|open (now|today|tonight|tomorrow|until)|release date|(come|comes|coming) out)\\b",
+            RegexOption.IGNORE_CASE)
+        // A little life for directions told as they come, when her own retelling isn't to be had.
+        private val OPENERS = listOf("Right, bus it is.", "Easy one.", "Here's the plan.", "Got you covered.")
+        // Taking or declining an offer she just made.
+        private val YES_TO_OFFER = Regex("^(oh |well |ok |okay )?(yes|yeah|yep|yup|sure|please|ok|okay|go ahead|do it|open it|why not)\\b",
+            RegexOption.IGNORE_CASE)
+        private val NO_TO_OFFER = Regex("^(oh |well |ok |okay )?(no|nope|nah|no thanks|not now|don'?t)\\b", RegexOption.IGNORE_CASE)
+        // Words for "the place we were just talking about".
+        private val PLACE_PRONOUNS = setOf("it", "there", "that", "that place", "this place", "the place", "the store",
+            "the shop", "that one", "the same place")
         private val CONFIRMATIONS = listOf(
             "Got it — I'll remember that.",
             "Noted. It's safe with me.",

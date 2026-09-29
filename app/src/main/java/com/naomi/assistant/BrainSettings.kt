@@ -62,6 +62,11 @@ class BrainSettings(context: Context) {
         get() = prefs.getString("custom_base_url", "").orEmpty()
         set(value) = prefs.edit().putString("custom_base_url", value.trim()).apply()
 
+    /** The user's own SearXNG server, for looking things up (see [SearchClient]); blank means DuckDuckGo. */
+    var searchUrl: String
+        get() = prefs.getString("search_url", "").orEmpty()
+        set(value) = prefs.edit().putString("search_url", value.trim()).apply()
+
     /** Who Naomi is. Blank means [DEFAULT_PERSONA]. */
     var persona: String
         get() = prefs.getString("persona", null)?.takeIf { it.isNotBlank() } ?: DEFAULT_PERSONA

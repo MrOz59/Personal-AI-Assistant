@@ -17,6 +17,8 @@ data class TurnContext(
     val where: String? = null,
     val speaker: Who = Who.UNKNOWN,
     val memories: List<String> = emptyList(),
+    /** The speech recognizer's other guesses at what was just said, when it wasn't sure. */
+    val heardAs: List<String> = emptyList(),
 )
 
 /**
@@ -33,6 +35,9 @@ class CloudBrain(private val llm: LlmClient, private val persona: String) {
 
     /** What she says out loud, and the phone action to run (null = just talking). */
     data class Response(val say: String, val action: JSONObject?)
+
+    /** Her answer from web search results, and whether the results held one. */
+    data class Answer(val say: String, val found: Boolean)
 
     /**
      * One conversational turn. [history] is the recent (user, Naomi) exchanges.
@@ -90,6 +95,59 @@ class CloudBrain(private val llm: LlmClient, private val persona: String) {
     }
 
     /**
+     * A line to say before, and one after, a result the phone reads out word for word — bus
+     * directions, where a retelling can swap a departure time for an arrival and cost a bus. Her
+     * reaction, a quip or a tip, with no numbers or directions of her own. Either line is null if
+     * it was left out or tried to add facts; both, if the brain can't be reached.
+     */
+    suspend fun frame(
+        userText: String,
+        fact: String,
+        history: List<Pair<String, String>>,
+        ctx: TurnContext,
+    ): Pair<String?, String?> = withContext(Dispatchers.IO) {
+        val raw = try {
+            llm.complete(framePrompt(persona, ctx, Date(), fact), plainTurns(history, userText), FRAME_SCHEMA, creative = true)
+        } catch (e: LlmException) {
+            return@withContext null to null
+        }
+        android.util.Log.d("Naomi", "Cloud frame: $raw")
+        parseFrame(raw)
+    }
+
+    /**
+     * What they asked ([userText]) answered from web search [results] for [query], in her voice.
+     * Null if the brain can't be reached, or if the answer states a number the results don't
+     * have — a small model fills in a score or a price it half remembers.
+     */
+    suspend fun answerFrom(
+        userText: String,
+        query: String,
+        results: List<SearchClient.Result>,
+        history: List<Pair<String, String>>,
+        ctx: TurnContext,
+    ): Answer? = withContext(Dispatchers.IO) {
+        val now = Date()
+        // The results come with the question: that's where a small model looks for what to answer from.
+        val turns = plainTurns(history.takeLast(ANSWER_HISTORY), searchTurn(userText, query, results, now))
+        val source = (results.flatMap { listOfNotNull(it.title, it.snippet, it.published) } +
+            listOf(userText, query, searchTurn("", "", emptyList(), now))).joinToString(" ")
+        // Lively first; if that strays from the results, once more at a steadier temperature.
+        for (creative in listOf(true, false)) {
+            val raw = try {
+                llm.complete(answerPrompt(persona, ctx, now), turns, ANSWER_SCHEMA, creative = creative)
+            } catch (e: LlmException) {
+                return@withContext null
+            }
+            android.util.Log.d("Naomi", "Cloud answer: $raw")
+            parseAnswer(raw, known = listOfNotNull(userText, ctx.facts["name"]).joinToString(" "))
+                ?.takeIf { statesOnly(source, it.say) }?.let { return@withContext it }
+            android.util.Log.d("Naomi", "That answer isn't all from the results")
+        }
+        null
+    }
+
+    /**
      * Facts worth keeping long-term from something the user just said, as (topic, fact) pairs —
      * a newer fact on the same topic replaces the old one. [known] are related memories already
      * kept, so they aren't stored twice; [asked] is her question they were answering, if any.
@@ -127,7 +185,7 @@ class CloudBrain(private val llm: LlmClient, private val persona: String) {
                 "remembering, reply NONE."
             try {
                 cleanSpeech(llm.complete(system, listOf(Turn(fromUser = true, text = transcript))))
-                    .replace(Regex("^(note to self|note|summary)\\s*:\\s*", RegexOption.IGNORE_CASE), "")
+                    .replace(Regex("^(note( to self| for myself| to myself)?|summary)\\s*:\\s*", RegexOption.IGNORE_CASE), "")
                     .takeIf { it.isNotBlank() && !it.trim('.', ' ').equals("NONE", ignoreCase = true) }
             } catch (e: LlmException) {
                 null
@@ -224,6 +282,12 @@ class CloudBrain(private val llm: LlmClient, private val persona: String) {
                 appendLine("Things you remember that may bear on this (use them naturally, only if they fit):")
                 ctx.memories.forEach { appendLine("- $it") }
             }
+            if (ctx.heardAs.isNotEmpty()) {
+                // English isn't their first language, and the recognizer trips on it: its runners-up
+                // often hold the word it got wrong ("closest work" / "closest Woolworths").
+                appendLine("Speech recognition wasn't sure of their last words. Its other guesses: " +
+                    ctx.heardAs.joinToString("; ") { "\"$it\"" } + ". Take whichever makes most sense in the conversation.")
+            }
         }
 
         /**
@@ -232,7 +296,7 @@ class CloudBrain(private val llm: LlmClient, private val persona: String) {
          */
         fun chatPrompt(persona: String, ctx: TurnContext, now: Date): String = buildString {
             appendVoiceAndContext(persona, ctx, now)
-            appendLine("- You can't see live information like the weather, the news or the phone's battery; if asked, say you'll check.")
+            appendLine("- You can't see live information like the weather, the news or the phone's battery; if asked, offer to look it up.")
             appendLine("- Don't make up facts. If you're not sure, say so and keep it light.")
             appendLine()
             append("Reply with only the words you'd say out loud.")
@@ -298,6 +362,155 @@ class CloudBrain(private val llm: LlmClient, private val persona: String) {
                 "written as digits. Reply with only the words you'd say out loud.")
         }
 
+        /** The prompt for the lines around directions the phone reads out as they are ([frame]). */
+        fun framePrompt(persona: String, ctx: TurnContext, now: Date, fact: String): String = buildString {
+            appendVoiceAndContext(persona, ctx, now)
+            appendLine()
+            appendLine("WHAT JUST HAPPENED")
+            appendLine("The phone worked out the way there, and reads it out word for word: \"$fact\"")
+            append("Add your touch around it, speaking to them: one short line just before it — your reaction to " +
+                "what they asked — and one just after it, a send-off: a wish, a joke or a practical reminder, never " +
+                "the route again. No directions, stops, times or numbers of your own, and no question after it: the " +
+                "phone offers the map next. Reply with JSON only: {\"before\": \"...\", \"after\": \"...\"}")
+        }
+
+        // A line describing the request instead of answering it: "Ozzy wants to know how to…".
+        private val NARRATING = Regex("\\b(wants to know|is asking|asked (me )?(how|where|about)|the user|they want to)\\b",
+            RegexOption.IGNORE_CASE)
+
+        private const val FRAME_SCHEMA = """{"type":"object","properties":{"before":{"type":"string"},""" +
+            """"after":{"type":"string"}},"required":["before","after"],"additionalProperties":false}"""
+
+        /**
+         * The lines of a [frame] reply: each kept only if it's short, states no number, and — the
+         * one after — asks nothing (the map offer comes next).
+         */
+        fun parseFrame(raw: String): Pair<String?, String?> {
+            val text = raw.replace(Regex("(?s)<think>.*?</think>"), "")
+            val start = text.indexOf('{')
+            val end = text.lastIndexOf('}')
+            if (start !in 0 until end) return null to null
+            val json = try {
+                JSONObject(text.substring(start, end + 1))
+            } catch (_: JSONException) {
+                return null to null
+            }
+            fun line(key: String) = cleanSpeech(json.optString(key))
+                .takeIf { it.isNotBlank() && it.length <= 160 && numbersIn(it).isEmpty() && !NARRATING.containsMatchIn(it) }
+                ?.let { if (it.last() in ".!?…") it else "$it." }
+            return line("before") to line("after")?.takeUnless { it.endsWith("?") }
+        }
+
+        /** The prompt for answering from web search results ([answerFrom]); the results come in [searchTurn]. */
+        fun answerPrompt(persona: String, ctx: TurnContext, now: Date): String = buildString {
+            appendVoiceAndContext(persona, ctx, now)
+            appendLine()
+            appendLine("LOOKING THINGS UP")
+            appendLine("You searched the web for what they asked. Their message holds the results, then their question.")
+            appendLine("- \"answer\": what the results say, in a sentence or two, the way you'd tell them. Names, numbers and " +
+                "dates exactly as the results give them, and nothing the results don't say, not even what you think you know.")
+            appendLine("- Mind today's date: anything dated before today has already happened, and \"next\" means after today.")
+            appendLine("- For something that changes, like a price or a score, say when it's from.")
+            appendLine("- \"comment\": then one short line of your own — a reaction, a quip or a thought — with no facts or numbers.")
+            appendLine("- If the results don't answer it, \"found\" is false and \"answer\" says so in a line.")
+            appendLine("- Never read out websites or links.")
+            append("Reply with JSON only: {\"found\": true, \"answer\": \"...\", \"comment\": \"...\"}")
+        }
+
+        /**
+         * Their question with what the search found, as the turn she answers — today's date up
+         * front, so "next" and "last year" are read against it.
+         */
+        fun searchTurn(userText: String, query: String, results: List<SearchClient.Result>, now: Date): String = buildString {
+            // The year spelled out too: a small model given 2026 took "last year" for 2024.
+            val year = SimpleDateFormat("yyyy", Locale.ENGLISH).format(now).toInt()
+            appendLine("Web results for \"$query\" (today is ${SimpleDateFormat("EEEE d MMMM yyyy", Locale.ENGLISH).format(now)}; " +
+                "last year was ${year - 1}):")
+            results.forEachIndexed { i, r ->
+                val from = listOfNotNull(r.site.ifBlank { null }, r.published).joinToString(", ")
+                appendLine("${i + 1}. ${r.title}${if (from.isEmpty()) "" else " ($from)"}: ${r.snippet}")
+            }
+            appendLine()
+            append("My question: $userText")
+        }
+
+        private val PLACEHOLDER = Regex("\\[[^\\]]*\\]")
+
+        /** Capitalised words past the start of a sentence — names, as a model uses them — lowercased. */
+        private fun namesIn(text: String): List<String> {
+            val tokens = text.split(Regex("\\s+"))
+            return tokens.indices.filter { i ->
+                i > 0 && !tokens[i - 1].endsWith(".") && !tokens[i - 1].endsWith("!") && !tokens[i - 1].endsWith("?") &&
+                    tokens[i].firstOrNull()?.isUpperCase() == true && !tokens[i].startsWith("I'") && tokens[i] != "I"
+            }.map { word(tokens[it]) }
+        }
+
+        private fun wordsOf(text: String): Set<String> = text.split(Regex("\\s+")).map(::word).toSet()
+
+        private fun word(token: String) = token.lowercase(Locale.ROOT).trim { !it.isLetterOrDigit() }.removeSuffix("'s").removeSuffix("’s")
+
+        // The recent exchanges an answer from search results sees: enough for a follow-up, and
+        // short enough that a small model's context still has room for the results.
+        private const val ANSWER_HISTORY = 3
+
+        // Whether it answered decides whether she offers to open the search, so it comes first; her
+        // own comment is kept apart from the facts, where it can be checked for made-up ones.
+        private const val ANSWER_SCHEMA = """{"type":"object","properties":{"found":{"type":"boolean"},""" +
+            """"answer":{"type":"string"},"comment":{"type":"string"}},"required":["found","answer","comment"],""" +
+            """"additionalProperties":false}"""
+
+        /**
+         * The answer in an [answerFrom] reply, with her comment after it when it states no facts of
+         * its own — no numbers, no names that neither the answer nor [known] (their question, their
+         * name) has — and there was an answer to comment on. Null if there's none to be had.
+         */
+        fun parseAnswer(raw: String, known: String = ""): Answer? {
+            val text = raw.replace(Regex("(?s)<think>.*?</think>"), "")
+            val start = text.indexOf('{')
+            val end = text.lastIndexOf('}')
+            if (start !in 0 until end) return cleanSpeech(text).takeIf { it.isNotBlank() }?.let { Answer(it, true) }
+            val json = try {
+                JSONObject(text.substring(start, end + 1))
+            } catch (_: JSONException) {
+                return null
+            }
+            fun sentence(s: String) = if (s.last() in ".!?…") s else "$s."
+            val answer = cleanSpeech(json.optString("answer").ifBlank { json.optString("say") })
+                // "October [insert date]": a gap it didn't fill is no answer.
+                .takeIf { it.isNotBlank() && !PLACEHOLDER.containsMatchIn(it) } ?: return null
+            val found = json.optBoolean("found", true)
+            val comment = cleanSpeech(json.optString("comment"))
+                .takeIf { found && it.isNotBlank() && it.length <= 160 && numbersIn(it).isEmpty() && !NARRATING.containsMatchIn(it) }
+                ?.takeIf { comment -> namesIn(comment).all { it in wordsOf("$answer $known") } }
+            return Answer(listOfNotNull(sentence(answer), comment?.let(::sentence)).joinToString(" "), found)
+        }
+
+        /**
+         * Whether every number [said] states is one [source] has, as written or rounded ("8.3
+         * million" or "84 thousand" for 83,802) — so an answer can't slip in a score, a price or
+         * a date the results never gave.
+         */
+        fun statesOnly(source: String, said: String): Boolean {
+            val given = digitGroups(source)
+            return digitGroups(said).all { n ->
+                given.any { g ->
+                    g.startsWith(n) ||
+                        // Rounded up: "84" from "83802".
+                        (n.length < 18 && g.length > n.length && g[n.length] >= '5' && (g.take(n.length).toLong() + 1).toString() == n)
+                }
+            }
+        }
+
+        /** The numbers in [text] as their digits alone ("$83,802.46" → "8380246"), spelled-out ones included, bar "one". */
+        private fun digitGroups(text: String): List<String> {
+            val words = text.lowercase(Locale.ENGLISH)
+                .replace(Regex("(?<=[a-z])-(?=[a-z])"), " ")
+                .replace(Regex("\\bone\\b"), "one_")
+            val normalized = CommandRouter.wordsToDigits(words).replace(Regex("(\\d+)\\s+point\\s+(\\d+)"), "$1.$2")
+            return Regex("\\d(?:[\\d,.]*\\d)?").findAll(normalized)
+                .map { it.value.replace(",", "").replace(".", "").trimStart('0').ifEmpty { "0" } }.toList()
+        }
+
         /**
          * Whether a retelling of [fact] can be trusted: every number it states — in digits or
          * words — is one the fact gave (rounding allowed), and it keeps the fact's first,
@@ -337,6 +550,8 @@ class CloudBrain(private val llm: LlmClient, private val persona: String) {
                 .replace(Regex("\\*[^*]{1,40}\\*"), "")
                 .replace(Regex("\\((laughs|chuckles|giggles|smiles|grins|sighs|winks)[^)]{0,30}\\)", RegexOption.IGNORE_CASE), "")
                 .replace(Regex("^\\s*(Naomi|Assistant)\\s*:\\s*", RegexOption.IGNORE_CASE), "")
+                // Emoji, which the voice would read out by name.
+                .replace(Regex("[\\p{So}\\x{1F3FB}-\\x{1F3FF}\\x{FE0F}\\x{200D}]"), "")
                 .replace(Regex("\\s{2,}"), " ")
                 .trim().trim('"').trim()
             if (text.length <= MAX_SPOKEN_CHARS) return text
@@ -353,10 +568,23 @@ class CloudBrain(private val llm: LlmClient, private val persona: String) {
                 appendLine("You can also operate the phone. When the user asks for one of these, return it as \"action\":")
                 ACTIONS.forEach { appendLine("  ${it.signature}") }
                 appendLine("- A plain phone call is \"call\", a WhatsApp voice call is \"whatsapp_call\", any video call is \"whatsapp_video\".")
-                appendLine("- \"How far\" or \"how long to get to\" a place is \"distance\"; \"take me there\" is \"navigate\".")
+                appendLine("- \"How far\" or \"how long to get to\" a named place is \"distance\"; \"where's the nearest\" or " +
+                    "\"how far is the closest\" kind of place or shop (bus stop, pharmacy, Woolworths) is \"nearest\"; " +
+                    "\"take me there\" is \"navigate\"; \"show me on the map\" is \"maps_search\".")
+                appendLine("- \"How do I get to\" a place, \"how can I get there by bus\", \"which bus goes to\" it is " +
+                    "\"directions\": she explains the way, then offers the map. \"Take me there\" is \"navigate\".")
+                appendLine("- For \"distance\", \"nearest\" and \"directions\", \"mode\" is \"walk\" on foot (or with no car), " +
+                    "\"drive\" by car, \"transit\" by bus, train or ferry, else empty. A follow-up like \"and walking?\" or " +
+                    "\"how do I get there?\" is about the place just discussed — leave \"destination\" empty.")
                 appendLine("- \"Remember that…\" is \"remember\" (the fact as a short sentence about them); \"forget…\" is \"forget\".")
                 appendLine("- Only act when they actually ask. Talking about calling someone is not a request to call; questions and chat need no action.")
                 appendLine("- Live information — weather, battery, their calendar — only ever comes from its action. Never guess it.")
+                appendLine("- \"look_up\" searches the web and answers from what it finds. Use it for anything current or that " +
+                    "changes — news, scores and results, prices, opening hours, release dates, who holds a job now — for facts " +
+                    "you're not sure of, and when they say search, google or look up. A follow-up on something looked up (\"when do " +
+                    "they play next?\") is \"look_up\" too. Its \"query\" is a short web search that makes sense on its own: fill " +
+                    "in who or what from the conversation. Timeless knowledge needs no search.")
+                appendLine("- \"web_search\" only opens the search page on the phone, for when they ask to see or open it.")
                 appendLine("- If something essential is missing (who to call, what to say), ask instead of guessing. Never invent contacts.")
                 appendLine("- Keep a message's words exactly as they said them.")
                 appendLine("- Speech recognition mishears names and songs; fix obvious mistakes.")
@@ -382,7 +610,12 @@ class CloudBrain(private val llm: LlmClient, private val persona: String) {
             "call mom" to """{"action": {"type":"call","name":"mom"}, "say": ""}""",
             "text Sam that I'll be there in five" to """{"action": {"type":"send_sms","name":"Sam","message":"I'll be there in five"}, "say": ""}""",
             "will it rain tomorrow?" to """{"action": {"type":"weather","city":"","day":"tomorrow"}, "say": ""}""",
-            "how far am I from Bondi?" to """{"action": {"type":"distance","destination":"Bondi"}, "say": ""}""",
+            "how far am I from Bondi?" to """{"action": {"type":"distance","destination":"Bondi","mode":""}, "say": ""}""",
+            "where's the closest pharmacy?" to """{"action": {"type":"nearest","what":"pharmacy","mode":""}, "say": ""}""",
+            "how long to walk to the nearest bus stop?" to """{"action": {"type":"nearest","what":"bus stop","mode":"walk"}, "say": ""}""",
+            "how do I get to Manly by bus?" to """{"action": {"type":"directions","destination":"Manly","mode":"transit"}, "say": ""}""",
+            "what's bitcoin worth right now?" to """{"action": {"type":"look_up","query":"bitcoin price"}, "say": ""}""",
+            "when does the next Avengers movie come out?" to """{"action": {"type":"look_up","query":"next Avengers movie release date"}, "say": ""}""",
             "remember that I parked on level 3" to """{"action": {"type":"remember","fact":"The user parked on level 3"}, "say": ""}""",
             "I think I'll call it a day" to """{"action": null, "say": "Fair enough, you've earned it. Go put your feet up."}""",
         )
@@ -409,9 +642,12 @@ class CloudBrain(private val llm: LlmClient, private val persona: String) {
             Action("set_timer", Field("hours", "<int>", true), Field("minutes", "<int>", true), Field("seconds", "<int>", true)),
             Action("set_alarm", Field("hour", "<0-23>", true), Field("minute", "<0-59>", true)),
             Action("open_app", Field("name", "<app name>")),
+            Action("look_up", Field("query", "<short web search>")),
             Action("web_search", Field("query", "<text>")),
             Action("navigate", Field("destination", "<place>")),
-            Action("distance", Field("destination", "<place>")),
+            Action("distance", Field("destination", "<place>"), Field("mode", "<walk|drive|transit|>")),
+            Action("nearest", Field("what", "<kind of place or shop: bus stop, pharmacy, Woolworths…>"), Field("mode", "<walk|drive|transit|>")),
+            Action("directions", Field("destination", "<place, or empty for the one just discussed>"), Field("mode", "<walk|drive|transit|>")),
             Action("maps_search", Field("query", "<place or kind of place>")),
             Action("open_url", Field("url", "<website>")),
             Action("ride", Field("destination", "<place>"), Field("app", "<uber|ola|rapido|>")),

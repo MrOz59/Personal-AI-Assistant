@@ -282,6 +282,18 @@ class CommandRouter(private val context: Context) {
         }
     }
 
+    /** Opens the route to a point in Google Maps — [travelMode] "transit", "walking" or "driving". */
+    fun executeDirections(lat: Double, lon: Double, travelMode: String): Result {
+        val uri = Uri.parse("https://www.google.com/maps/dir/?api=1&destination=$lat,$lon&travelmode=$travelMode")
+        val maps = Intent(Intent.ACTION_VIEW, uri).setPackage("com.google.android.apps.maps").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        return try {
+            context.startActivity(maps)
+            Result.Handled("Here's the route in Maps.")
+        } catch (e: Exception) {
+            launch(Intent(Intent.ACTION_VIEW, uri).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), "Here's the route.")
+        }
+    }
+
     /** Find places on the map: "coffee near me", "petrol pumps", a landmark, etc. */
     fun executeMapsSearch(query: String): Result {
         if (query.isBlank()) return Result.Handled("What should I look for on the map?")

@@ -57,6 +57,9 @@ class WakeService : Service() {
     @Volatile private var firing = false // guards against repeat triggers mid-turn
     @Volatile private var answerMode = false // listening for a follow-up answer, not "Naomi"
     @Volatile private var enrollMode = false // collecting the owner's "Naomi"s for their voiceprint
+    // Listening wanted: a pause that lands while the model is still loading must stop it from
+    // starting once it's loaded — or the wake mic runs through the command turn.
+    @Volatile private var armed = false
     private var wakeLock: PowerManager.WakeLock? = null
 
     // Proximity sensor: blocks wake word firing when the phone is face-down or in a pocket.
@@ -95,6 +98,13 @@ class WakeService : Service() {
     private var ringPos = 0
     private var ringFilled = 0
 
+    // Samples fed to Vosk since listening started, and where its current utterance began: Vosk
+    // times words from there (on Android its clock restarts with each utterance).
+    private var fed = 0L
+    private var utteranceStart = 0L
+    // When "naomi" first showed up in Vosk's running guess for this utterance; 0 while it hasn't.
+    private var wakeSeenAt = 0L
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
@@ -112,7 +122,7 @@ class WakeService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
-            ACTION_PAUSE -> { enrollMode = false; stopWake() } // Activity is about to use the mic itself
+            ACTION_PAUSE -> { enrollMode = false; armed = false; stopWake() } // Activity is about to use the mic itself
             ACTION_ANSWER -> { answerMode = true; enrollMode = false; startForegroundCompat(); armWhenReady() }
             ACTION_ENROLL -> {
                 answerMode = false; enrollMode = true
@@ -129,11 +139,12 @@ class WakeService : Service() {
 
     /** Load the model if needed, then start listening. */
     private fun armWhenReady() {
+        armed = true
         val m = model
         if (m != null) { startWake(m); return }
         StorageService.unpack(
             this, "vosk-model-en", "model",
-            { loaded -> model = loaded; startWake(loaded) },
+            { loaded -> model = loaded; if (armed) startWake(loaded) },
             { e -> android.util.Log.e("Naomi", "Vosk model load failed: ${e.message}") }
         )
     }
@@ -157,6 +168,7 @@ class WakeService : Service() {
                 maxOf(minBuf, SAMPLE_RATE)
             )
             ringPos = 0; ringFilled = 0
+            fed = 0L; utteranceStart = 0L; wakeSeenAt = 0L
             firing = false
             // Answer mode reacts fast (AEC handles the TTS); wake mode waits out arming transient.
             cooldownUntil = System.currentTimeMillis() + if (answerMode) 300 else 1200
@@ -173,6 +185,7 @@ class WakeService : Service() {
 
             record?.startRecording()
             listening = true
+            micActive = true
             // Register proximity sensor so pocket/face-down blocks false wake word triggers.
             proximitySensor?.let {
                 sensorManager?.registerListener(proximityListener, it, SensorManager.SENSOR_DELAY_NORMAL)
@@ -202,53 +215,71 @@ class WakeService : Service() {
             lastReadMs = now
             if (hasSignal(buf, n)) lastSignalMs = now
             appendRing(buf, n)
-            // Finals only — partials are speculative and cause false triggers.
-            if (!reco.acceptWaveForm(buf, n)) continue
-            try {
-                val json = JSONObject(reco.result)
-                val text = json.optString("text").trim().lowercase()
-                // Answer mode: any recognized answer word (grammar-restricted) is the reply.
-                // No "Naomi" needed; AEC keeps Naomi's own voice from triggering it.
-                if (answerMode) {
-                    // Filter [unk] — Vosk's "uncertain" token; not a real answer.
-                    if (text.isEmpty() || text == "[unk]" || firing || System.currentTimeMillis() < cooldownUntil) continue
-                    firing = true
-                    cooldownUntil = System.currentTimeMillis() + 1500
-                    android.util.Log.i("Naomi", "Answer heard: \"$text\"")
-                    main.post { answerCallback?.invoke(text) }
-                    continue
+            fed += n
+            // Finals, not partials, are acted on: partials are speculative and cause false triggers.
+            val result = when {
+                reco.acceptWaveForm(buf, n) -> reco.result
+                // Steady noise (a street, a café) can keep Vosk from hearing the pause it waits
+                // for to close an utterance. Once "naomi" has held in its running guess for a
+                // moment, close the utterance here instead.
+                !answerMode && mentionsWake(reco.partialResult) -> {
+                    if (wakeSeenAt == 0L) wakeSeenAt = now
+                    if (now - wakeSeenAt < FORCE_FINAL_MS) continue
+                    reco.finalResult
                 }
-                if (text.isEmpty() || text !in WAKE_PHRASES) continue
-                if (System.currentTimeMillis() < cooldownUntil) continue
-
-                // ── Noise filters ─────────────────────────────────────────────
-                val wordArray = json.optJSONArray("result")
-                val words = (0 until (wordArray?.length() ?: 0))
-                    .mapNotNull { wordArray?.optJSONObject(it) }
-
-                // 1. Confidence gate: noise mis-recognitions land at 0.80–0.87;
-                //    a cleanly spoken "naomi" is reliably ≥ 0.88.
-                val minConf = words.mapNotNull { it.optDouble("conf").takeIf { !it.isNaN() } }
-                    .minOrNull() ?: 0.0
-
-                // 2. Duration gate: real "naomi" takes 0.25–0.80 s.
-                //    Sub-0.20 s spikes are noise; >0.90 s suggests garbled speech.
-                val naomiWord = words.firstOrNull { it.optString("word") == "naomi" }
-                val duration = if (naomiWord != null)
-                    naomiWord.optDouble("end") - naomiWord.optDouble("start") else -1.0
-
-                android.util.Log.i("Naomi",
-                    "Wake candidate: \"$text\" conf=${"%.2f".format(minConf)} dur=${"%.2f".format(duration)}s")
-
-                val confOk     = minConf >= MIN_CONFIDENCE
-                val durationOk = duration < 0 || duration in 0.20..0.90   // -1 = not parseable, allow
-                if (confOk && durationOk) onWakeCandidate(text, phraseClip(words))
-                else android.util.Log.d("Naomi",
-                    "Wake rejected: conf=${"%.2f".format(minConf)} (need≥$MIN_CONFIDENCE) dur=${"%.2f".format(duration)}s")
+                else -> { wakeSeenAt = 0L; continue }
+            }
+            val started = utteranceStart
+            utteranceStart = fed
+            wakeSeenAt = 0L
+            try {
+                val json = JSONObject(result)
+                if (answerMode) onAnswerResult(json) else onWakeResult(json, started)
             } catch (e: Exception) {
                 android.util.Log.e("Naomi", "Wake parse error: ${e.message}")
             }
         }
+    }
+
+    /**
+     * Answer mode: any recognized answer word (grammar-restricted) is the reply — no "Naomi"
+     * needed; AEC keeps Naomi's own voice from triggering it.
+     */
+    private fun onAnswerResult(json: JSONObject) {
+        val text = json.optString("text").trim().lowercase()
+        // Filter [unk] — Vosk's "uncertain" token; not a real answer.
+        if (text.isEmpty() || text == "[unk]" || firing || System.currentTimeMillis() < cooldownUntil) return
+        firing = true
+        cooldownUntil = System.currentTimeMillis() + 1500
+        android.util.Log.i("Naomi", "Answer heard: \"$text\"")
+        main.post { answerCallback?.invoke(text) }
+    }
+
+    /**
+     * A closed utterance in wake mode, begun at sample [started]: acts on the "naomi" in it if
+     * it's convincing enough.
+     */
+    private fun onWakeResult(json: JSONObject, started: Long) {
+        val hit = findWake(json) ?: return
+        if (System.currentTimeMillis() < cooldownUntil) return
+        val text = json.optString("text").trim()
+        android.util.Log.i("Naomi", "Wake candidate: \"$text\" conf=${"%.2f".format(hit.conf)} dur=${"%.2f".format(hit.duration)}s")
+        // Word confidence: noise mis-heard as "naomi" lands at 0.80–0.87, a clearly spoken one at
+        // ≥ 0.88. With a voiceprint, the voice check stands behind the word, so a "naomi" with
+        // noise around it — or a little less sure — goes on to the check. Without one (or while
+        // training), only a clean, confident "naomi" counts, as before.
+        val confident = hit.clean && hit.conf >= MIN_CONFIDENCE
+        val checked = enrollment.isEnrolled && !enrollMode && hit.conf >= MIN_CONFIDENCE_CHECKED
+        // A real "naomi" takes 0.25–0.80 s: shorter is a noise spike, longer is garbled speech.
+        val durationOk = hit.duration.isNaN() || hit.duration in 0.20..0.90
+        if (!durationOk || !(confident || checked)) {
+            VoiceLog.add(this, "Heard \"$text\": passed over (word confidence ${"%.2f".format(hit.conf)}" +
+                (if (durationOk) "" else ", ${"%.2f".format(hit.duration)} s long") + ")")
+            VoiceDebug.keep(this, "passed", snapshotLastN(ringFilled), JSONObject().put("vosk", json)
+                .put("utterance_start", started).put("fed", fed))
+            return
+        }
+        onWakeCandidate(text, hit, confident, wakeCuts(hit, started, json))
     }
 
     /** Cheap check: does the buffer contain any non-zero sample (i.e. a live mic feed)? */
@@ -296,43 +327,89 @@ class WakeService : Service() {
     }
 
     /**
-     * The wake phrase itself, cut from the ring. Its length comes from Vosk's word timings, but
-     * not where it sits — on Android, Vosk's timestamps restart with every utterance — so the
-     * end comes from the audio: the last stretch of speech, just before the silence that made
-     * Vosk finalize. Enrollment and verification both use this cut, so the two sides of the
-     * voice comparison hear the same thing, without trailing silence diluting the voiceprint.
-     * Falls back to the newest 1.5 s if the phrase can't be located.
+     * The wake word cut out of the recent audio two ways: where Vosk's timing puts it (from the
+     * utterance's start), and ending where the audio's last stretch of speech ends. Noise can
+     * throw the audio cut off, and the timed cut needs the word still in the ring, so the voice
+     * check tries both; training takes the timed cut when the two agree, else the audio's, which
+     * is reliable in the quiet room training happens in. Falls back to the newest 1.5 s.
      */
-    private fun phraseClip(words: List<JSONObject>): ShortArray {
-        val start = words.minOfOrNull { it.optDouble("start", Double.NaN) } ?: Double.NaN
-        val end = words.maxOfOrNull { it.optDouble("end", Double.NaN) } ?: Double.NaN
-        val recent = snapshotLastN(SEARCH_SAMPLES)
-        val speechEnd = lastSpeechEnd(recent, SAMPLE_RATE)
-        if (start.isNaN() || end.isNaN() || end <= start || speechEnd == null) {
-            android.util.Log.w("Naomi", "Wake clip: couldn't locate the phrase — using the newest audio")
-            return snapshotLastN(FALLBACK_CLIP_SAMPLES)
-        }
+    private fun wakeCuts(hit: WakeHit, started: Long, vosk: JSONObject): WakeCuts {
+        val recent = snapshotLastN(ringFilled)
         val margin = (CLIP_MARGIN_S * SAMPLE_RATE).toInt()
-        val from = maxOf(0, speechEnd - ((end - start) * SAMPLE_RATE).toInt() - margin)
-        val to = minOf(recent.size, speechEnd + margin)
-        return recent.copyOfRange(from, to)
+        val window = wakeWindow(hit, started, fed, recent.size, margin, SAMPLE_RATE)
+        val timed = window?.let { recent.copyOfRange(it.first, it.last + 1) }
+        val searchFrom = maxOf(0, recent.size - SEARCH_SAMPLES)
+        val search = recent.copyOfRange(searchFrom, recent.size)
+        val speechEnd = lastSpeechEnd(search, SAMPLE_RATE)?.takeIf { !hit.duration.isNaN() }
+        val heard = speechEnd?.let { end ->
+            search.copyOfRange(maxOf(0, end - (hit.duration * SAMPLE_RATE).toInt() - margin), minOf(search.size, end + margin))
+        }
+        // How far apart the two cuts put the word's end, in ms — logged to see which one holds up.
+        val apartMs = if (window != null && speechEnd != null) {
+            val timedEnd = started + (hit.end * SAMPLE_RATE).toLong() - (fed - recent.size)
+            ((searchFrom + speechEnd - timedEnd) * 1000 / SAMPLE_RATE).toInt()
+        } else null
+        val snr = snrDb(search, SAMPLE_RATE)
+        val noise = snr?.let { "voice ${it.toInt()} dB over the background" } ?: "background unknown"
+        // Where everything landed, in samples of [recent] — for VoiceDebug.
+        val info = JSONObject().put("vosk", vosk).put("utterance_start", started).put("fed", fed)
+            .put("available", recent.size).put("snr_db", snr ?: JSONObject.NULL)
+            .put("timed_cut", window?.let { org.json.JSONArray(listOf(it.first, it.last + 1)) } ?: JSONObject.NULL)
+            .put("speech_end", speechEnd?.let { searchFrom + it } ?: JSONObject.NULL)
+            .put("apart_ms", apartMs ?: JSONObject.NULL)
+        return when {
+            timed != null && heard != null -> WakeCuts(listOf("timed" to timed, "audio" to heard),
+                if (kotlin.math.abs(apartMs!!) <= CUTS_AGREE_MS) timed else heard, "$noise, cuts $apartMs ms apart", recent, info)
+            timed != null -> WakeCuts(listOf("timed" to timed), timed, "$noise, timed cut only", recent, info)
+            heard != null -> WakeCuts(listOf("audio" to heard), heard, "$noise, audio cut only", recent, info)
+            // Mostly the silence after the word: checked, but never trained on.
+            else -> snapshotLastN(FALLBACK_CLIP_SAMPLES).let {
+                WakeCuts(listOf("fallback" to it), null, "$noise, couldn't place the word", recent, info)
+            }
+        }
     }
 
     /**
-     * Wake phrase recognized. In enroll mode the clip goes to the trainer; otherwise, if a voice
-     * profile exists, the speaker is verified off-thread and we fire or refuse.
+     * The wake word as cut out for the voice check (each cut named), the cut training keeps (null
+     * when the word couldn't be placed), how it went, and — for VoiceDebug — the audio it was cut
+     * from with where the cuts landed.
      */
-    private fun onWakeCandidate(phrase: String, clip: ShortArray) {
+    private class WakeCuts(
+        val clips: List<Pair<String, ShortArray>>,
+        val forTraining: ShortArray?,
+        val note: String,
+        val audio: ShortArray,
+        val info: JSONObject,
+    )
+
+    /**
+     * Wake phrase recognized. In enroll mode the clip goes to the trainer; otherwise, if a voice
+     * profile exists, the speaker is verified off-thread and we fire or refuse. [confident]: a
+     * clean, clearly spoken "naomi" — the only kind refused out loud.
+     */
+    private fun onWakeCandidate(phrase: String, hit: WakeHit, confident: Boolean, cuts: WakeCuts) {
         if (firing) return
         // Training: the phone is in hand (maybe near the face), so skip the pocket check.
         if (enrollMode) {
             cooldownUntil = System.currentTimeMillis() + ENROLL_GAP_MS
+            val clip = cuts.forTraining
+            VoiceDebug.keep(this, "training", cuts.audio, cuts.info.put("kept", when {
+                clip == null -> "none"
+                clip === cuts.clips.first().second -> cuts.clips.first().first
+                else -> "audio"
+            }))
+            if (clip == null) {
+                VoiceLog.add(this, "Training: couldn't find the word in the audio (${cuts.note}) — not kept")
+                return
+            }
+            VoiceLog.add(this, "Training: \"$phrase\" (${cuts.note})")
             main.post { enrollCallback?.invoke(clip) }
             return
         }
         // Proximity sensor: if the screen is covered (pocket, face-down), don't fire.
         if (pocketBlocked) {
-            android.util.Log.d("Naomi", "Wake suppressed: phone in pocket (proximity blocked)")
+            VoiceLog.add(this, "Heard \"$phrase\": ignored, the phone was covered (pocket or face-down)")
+            VoiceDebug.keep(this, "pocket", cuts.audio, cuts.info)
             return
         }
         cooldownUntil = System.currentTimeMillis() + 3000
@@ -343,7 +420,11 @@ class WakeService : Service() {
         }
         // Always verify — also with the UI open, or anyone could barge in on an open Naomi.
         verifier.execute {
-            val sim = enrollment.similarity(clip)
+            // The better of the cuts: noise can throw one of them off.
+            val scores = cuts.clips.map { (name, clip) -> name to enrollment.similarity(clip) }
+            val sim = scores.mapNotNull { it.second }.maxOrNull()
+            VoiceDebug.keep(this, "wake", cuts.audio, cuts.info.put("threshold", similarityThreshold.toDouble())
+                .put("scores", JSONObject(scores.associate { (name, score) -> name to (score?.toDouble() ?: JSONObject.NULL) })))
             main.post {
                 if (sim != null) {
                     lastSimilarity = sim
@@ -354,13 +435,18 @@ class WakeService : Service() {
                         .putLong("last_similarity_at", lastSimilarityAt)
                         .apply()
                 }
-                val score = sim?.let { "%.3f".format(it) } ?: "none"
-                android.util.Log.d("Naomi", "voice similarity=$score (threshold $similarityThreshold, clip ${clip.size * 1000 / SAMPLE_RATE}ms)")
+                val score = sim?.let { "%.2f".format(it) } ?: "unreadable"
+                val heard = "\"$phrase\" (word ${"%.2f".format(hit.conf)}, ${cuts.note})"
                 if (sim != null && sim >= similarityThreshold) {
+                    VoiceLog.add(this, "$heard: your voice, $score")
                     onWakeAccepted(phrase)
                 } else {
                     firing = false
-                    denyAccess()
+                    // Out loud only for a clearly spoken, lone "Naomi": in noise, a failed check is as
+                    // likely a mis-heard sound as a stranger, and the phone shouldn't answer the street.
+                    VoiceLog.add(this, "$heard: voice $score, below ${"%.2f".format(similarityThreshold)}, refused" +
+                        if (confident) "" else " quietly")
+                    denyAccess(aloud = confident)
                 }
             }
         }
@@ -373,10 +459,10 @@ class WakeService : Service() {
 
     /**
      * Someone who isn't the enrolled owner said the wake phrase (or the voice couldn't be
-     * checked — we fail closed): refuse out loud and do nothing else. One refusal per burst of
-     * attempts, so repeated tries don't turn into a nagging loop.
+     * checked — we fail closed): do nothing else, and — when [aloud] — say so. One refusal per
+     * burst of attempts, so repeated tries don't turn into a nagging loop.
      */
-    private fun denyAccess() {
+    private fun denyAccess(aloud: Boolean) {
         // While Naomi is talking, an unrecognized "Naomi" is most likely her own voice leaking
         // past the echo canceller — ignore it rather than refuse herself mid-sentence.
         if (Speaker.speaking) {
@@ -384,6 +470,7 @@ class WakeService : Service() {
             return
         }
         deniedCallback?.invoke()
+        if (!aloud) return
         val now = System.currentTimeMillis()
         if (now < denyQuietUntil) return
         denyQuietUntil = now + DENY_REPEAT_MS
@@ -408,6 +495,7 @@ class WakeService : Service() {
         noiseSuppressor?.release(); noiseSuppressor = null
         try { record?.stop() } catch (e: Exception) {}
         record?.release(); record = null
+        micActive = false
         recognizer?.close(); recognizer = null
         releaseWakeLock()
     }
@@ -501,6 +589,12 @@ class WakeService : Service() {
         // Vosk word confidence threshold. Noise false-positives cluster at 0.80–0.87;
         // clean speech lands ≥ 0.88. Raise if noise still triggers; lower if Naomi misses you.
         private const val MIN_CONFIDENCE = 0.88
+        // With a voiceprint, a less certain "naomi" still goes on to the voice check.
+        private const val MIN_CONFIDENCE_CHECKED = 0.80
+        // How long "naomi" may sit in Vosk's running guess before the utterance is closed for it.
+        private const val FORCE_FINAL_MS = 700L
+        // Cuts this close together agree on where the word is.
+        private const val CUTS_AGREE_MS = 250
 
         // Cosine similarity to the owner's voiceprint needed to accept a wake — user-tunable from
         // Settings (persisted in prefs). On LibriSpeech clips the length of a wake phrase, CAM++
@@ -510,6 +604,13 @@ class WakeService : Service() {
         const val PREF_THRESHOLD = "voice_threshold"
         @Volatile var similarityThreshold = DEFAULT_SIMILARITY_THRESHOLD
 
+        /**
+         * Whether the wake listener holds the mic. The speech recognizer must not start while it
+         * does: Android silences the recognizer's mic in favour of the app's own.
+         */
+        @Volatile var micActive = false
+            private set
+
         /** Most recent voice-match score + when it happened (for the Settings read-out). */
         @Volatile var lastSimilarity = -1f
         @Volatile var lastSimilarityAt = 0L
@@ -517,7 +618,7 @@ class WakeService : Service() {
         private const val RING_SECONDS = 4
         // Audio kept on each side of the phrase when cutting it out.
         private const val CLIP_MARGIN_S = 0.15
-        // How far back to look for the phrase: it ends ~1 s before Vosk finalizes.
+        // How far back to look for the phrase by its sound: it ends ~1 s before Vosk finalizes.
         private const val SEARCH_SAMPLES = SAMPLE_RATE * 3
         private const val FALLBACK_CLIP_SAMPLES = SAMPLE_RATE * 3 / 2
         // Pause between accepted enrollment clips, so one "Naomi" can't count twice.
@@ -529,11 +630,6 @@ class WakeService : Service() {
         private const val WAKE_GRAMMAR =
             "[\"hey naomi\", \"hi naomi\", \"hello naomi\", \"good morning naomi\", " +
             "\"good night naomi\", \"okay naomi\", \"naomi\", \"[unk]\"]"
-
-        private val WAKE_PHRASES = setOf(
-            "naomi", "hey naomi", "hi naomi", "hello naomi",
-            "good morning naomi", "good night naomi", "okay naomi"
-        )
 
         // Restricted grammar for follow-up answers — lets the user reply over Naomi's question
         // with no wake word. Covers confirm/decline, app choice, edits, and contact picks.

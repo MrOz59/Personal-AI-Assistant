@@ -83,11 +83,18 @@ Grant the mic (and, for calls/messages, contacts + phone) permissions. Then try:
 - "play \<song\>"  •  "open settings"
 - "remember that I parked on level 3" → later, "where did I park?"  •  "forget that"
 - Turn on the **"Naomi" wake word** and say "Naomi" from the lock screen.
-- **Voice lock:** Settings → *Train my voice*: say "Naomi" 8 times, then talk freely for 15 seconds.
+- **Voice lock:** Settings → *Train my voice*: say "Naomi" 8 times.
   From then on only your voice wakes her — anyone else hears "Sorry, I don't recognize your voice.
-  You're not authorized to use me." In a conversation she tells voices apart: people talking to
-  *you* are ignored, and a guest who says "Naomi" is answered as a guest, never called by your name.
-  Tune *Voice match strictness* in Settings if she rejects you or lets others through.
+  You're not authorized to use me." Training drops any clip that caught silence instead of the word.
+  Tune *Voice match strictness* in Settings if she rejects you or lets others through. If she
+  doesn't respond somewhere, *Settings → Voice log* shows what happened to each "Naomi": heard or
+  passed over, the voice score, the noise around it, and recognizer errors.
+- "where's the closest bus stop / pharmacy / Woolworths?" — the nearest one around you, how far,
+  and how long on foot or by car; "and walking?" follows up on the same place. Tell her you don't
+  have a car and walking becomes the default.
+- "how do I get there by bus?" — the bus or train to catch, from which stop and when, where to get
+  off, and when you'd arrive (real timetables via [Transitous](https://transitous.org)) — then she
+  offers to open the route in Maps.
 
 The wake word and voice models are bundled in `app/src/main/assets/` (Vosk + ONNX), so it works out
 of the box. The larger on-device chat model (Gemma) is optional and loaded from device storage
@@ -126,9 +133,16 @@ See **[`FILES.md`](FILES.md)** for a one-line description of every source file. 
 - The "Naomi" wake word runs fully on-device (Vosk); audio for wake detection isn't sent anywhere.
   Voice verification is on-device too, with the [WeSpeaker](https://github.com/wenet-e2e/wespeaker)
   CAM++ model trained on VoxCeleb (CC BY 4.0).
-- Sentences are voice-checked by capturing the mic ourselves and handing the audio to Android's
-  speech recognizer (Android 13+). If the phone's speech service won't take audio that way, only the
-  wake phrase is checked — Settings shows which.
+- Only the wake phrase is voice-checked, not the sentences after it: Google's speech service needs the
+  mic to itself. On a Redmi (HyperOS), recording alongside it made Android silence the service's
+  mic, and handing it our own recording (`EXTRA_AUDIO_SOURCE`) got audio in but no words back.
+- Speech is recognized as the English of the country the phone is in (by its mobile network), so
+  local names come through — "Woolworths", not "wolves worth". The recognizer is hinted with the
+  names she knows, and when its best guess misses one that a runner-up has ("closest work" /
+  "closest Woolworths"), the runner-up wins.
+- "Nearest" questions send the phone's approximate location to OpenStreetMap's search (Nominatim)
+  and routers (OSRM); distances to named places use the platform geocoder and OSRM; bus and train
+  directions ask Transitous, with the start and end points.
 - This is a personal/hobby project — the WhatsApp calling and accessibility features depend on those
   apps' current layouts and may need tweaks over time.
 

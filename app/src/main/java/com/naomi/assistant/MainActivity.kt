@@ -148,13 +148,18 @@ import androidx.compose.animation.core.Animatable
 // Voice-match strictness slider bounds (cosine similarity to the owner's voiceprint).
 private const val VOICE_THRESHOLD_MIN = 0.20f
 private const val VOICE_THRESHOLD_MAX = 0.80f
-// Voice training: "Naomi"s collected per profile, and how long to wait for them; then how long
-// the owner talks freely for the any-sentence print.
+// Voice training: "Naomi"s collected per profile, and how long to wait for them.
 private const val ENROLL_CLIPS = 8
 private const val ENROLL_TIMEOUT_MS = 90_000L
-private const val FREE_SPEECH_MS = 15_000
 // Someone else's speech ignored this many times in a row ends the conversation.
 private const val MAX_IGNORED_IN_A_ROW = 2
+// Longest wait for the wake listener to let go of the mic before the recognizer starts.
+private const val MIC_HANDOVER_MS = 800L
+// A wake arriving this soon after the last one is its duplicate.
+private const val WAKE_REPEAT_MS = 2_000L
+// A noisy or short sentence scoring within this much below the voice-match threshold isn't taken
+// for someone else: noise pulls the owner's own score down that far.
+private const val UNSURE_MARGIN = 0.20f
 private const val PREF_LAST_SPEAKER_SIM = "last_speaker_similarity"
 
 /**
@@ -191,6 +196,8 @@ class MainActivity : ComponentActivity() {
     private var smartMode by mutableStateOf(false)
     private var factMode by mutableStateOf(false)
     private var turnJob: Job? = null // the in-flight assistant turn, so we can cancel on reset
+    private var listenStarting: Job? = null // a listen on its way (waiting for the mic), so it isn't started twice
+    private var lastWakeAt = 0L // when the last wake was acted on, to drop its duplicate
 
     // Power button (screen off) mid-interaction → stop everything and reset to idle.
     private val screenOffReceiver = object : BroadcastReceiver() {
@@ -216,6 +223,12 @@ class MainActivity : ComponentActivity() {
     private var lastSpeakerSim by mutableStateOf(-1f)
     private var speakerCheck by mutableStateOf<Boolean?>(null)
     private var ignoredInARow = 0
+    // The next sentence opens a turn the owner just started — by a verified "Naomi", or a tap on
+    // an unlocked phone — so it's theirs, however noise scores it.
+    private var trustNextSentence = false
+    // What the voice pipeline did lately (see VoiceLog), for the Settings screen.
+    private var voiceLog by mutableStateOf<List<String>>(emptyList())
+    private val voiceLogChanged: () -> Unit = { runOnUiThread { voiceLog = VoiceLog.recent(this) } }
 
     private val enrollment by lazy { VoiceEnrollment.get(this) }
 
@@ -288,10 +301,14 @@ class MainActivity : ComponentActivity() {
         WakeService.deniedCallback = { onVoiceDenied() }
         // Which cloud brain to use, its API key and Naomi's personality are set in-app (BRAIN).
         brain = AssistantBrain(this)
+        // "Let me check." while she looks something up, so the wait isn't silent.
+        brain.onAside = { line -> speaker.aside(line) }
         facts = brain.memory.all()
         memories = brain.memories.all()
         learning = brain.settings.learnMemories
         brain.memories.onChange = memoriesChanged
+        voiceLog = VoiceLog.recent(this)
+        VoiceLog.onChange = voiceLogChanged
         refreshBrainUi()
 
         // Ask for everything Naomi needs up front (mic to listen, contacts + phone to call).
@@ -373,6 +390,8 @@ class MainActivity : ComponentActivity() {
                         lastSimAt     = lastSimAt,
                         lastSpeakerSim = lastSpeakerSim,
                         speakerCheck  = speakerCheck,
+                        voiceLog      = voiceLog,
+                        onClearVoiceLog = { VoiceLog.clear(this@MainActivity) },
                         onThresholdChange = { onThresholdChange(it) },
                         onNavigate    = { screen = it },
                         onOrbTap      = { onMicTapped() },
@@ -403,6 +422,7 @@ class MainActivity : ComponentActivity() {
 
         handleWakeIntent(intent)
         handleAssistIntent(intent)
+        handleSttTest(intent)
     }
 
     override fun onResume() {
@@ -422,6 +442,7 @@ class MainActivity : ComponentActivity() {
         }
         lastSpeakerSim = getSharedPreferences("naomi", MODE_PRIVATE).getFloat(PREF_LAST_SPEAKER_SIM, -1f)
         speakerCheck = voice.speakerCheckSupported
+        voiceLog = VoiceLog.recent(this)
     }
 
     /** Persist and apply a new voice-match threshold from the Settings slider. */
@@ -445,6 +466,70 @@ class MainActivity : ComponentActivity() {
         setIntent(intent)
         handleWakeIntent(intent)
         handleAssistIntent(intent)
+        handleSttTest(intent)
+    }
+
+    /**
+     * Debug builds: `adb shell am start -n com.naomi.assistant/.MainActivity --es naomi_stt_test
+     * "what time is it" --ei lead_ms 1000` says the text into a file in her voice and has the
+     * recognizer hear it through the same pipe as the mic, after [lead_ms] of quiet — the outcome
+     * goes to the voice log. Tests the speech service with nobody talking.
+     */
+    private fun handleSttTest(intent: Intent?) {
+        if (!BuildConfig.DEBUG) return
+        // `--es naomi_turns "first|second~its runner-up|third"`: a conversation from typed words, as the owner —
+        // each reply logged, none spoken.
+        intent?.getStringExtra("naomi_turns")?.let { typed ->
+            intent.removeExtra("naomi_turns")
+            lifecycleScope.launch {
+                // "heard~other guess~another" stands in for the recognizer's runner-up guesses.
+                for (line in typed.split('|').map { it.trim() }.filter { it.isNotEmpty() }) {
+                    val guesses = line.split('~').map { it.trim() }
+                    val reply = brain.handle(guesses.first(), Who.OWNER, guesses.drop(1))
+                    android.util.Log.d("Naomi", "Turn test: \"$line\" → \"${reply.text}\"")
+                }
+            }
+            return
+        }
+        // `--es naomi_turn "where's the closest bus stop"`: a whole turn from typed words, as the owner.
+        intent?.getStringExtra("naomi_turn")?.let { typed ->
+            intent.removeExtra("naomi_turn")
+            if (wakeEnabled) WakeService.pause(this)
+            runTurn(typed, Who.OWNER)
+            return
+        }
+        val text = intent?.getStringExtra("naomi_stt_test") ?: return
+        intent.removeExtra("naomi_stt_test")
+        val leadMs = intent.getIntExtra("lead_ms", 0)
+        if (wakeEnabled) WakeService.pause(this)
+        if (intent.getBooleanExtra("aloud", false)) {
+            // Out loud: the service listens on its own mic, our copy alongside, while she says it.
+            val bargeIn = voice.onSpeechStart
+            voice.onSpeechStart = null
+            VoiceLog.add(this, "STT test aloud: \"$text\"")
+            voice.listen(
+                onResult = { heard ->
+                    voice.onSpeechStart = bargeIn
+                    VoiceLog.add(this, "STT test aloud heard: \"${heard.text}\"" +
+                        if (heard.alternatives.isEmpty()) "" else " (or: ${heard.alternatives.joinToString(" | ")})")
+                },
+                onError = { message -> voice.onSpeechStart = bargeIn; VoiceLog.add(this, "STT test aloud failed: $message") })
+            Handler(Looper.getMainLooper()).postDelayed({ speaker.speak(text) }, 900)
+            return
+        }
+        speaker.synthesize(text, java.io.File(cacheDir, "stt_test.wav"), onAudio = { speech ->
+            if (speech == null) {
+                VoiceLog.add(this, "STT test: couldn't make the test speech")
+                return@synthesize
+            }
+            val hiss = java.util.Random(5)
+            val audio = ShortArray(leadMs * 16) { (hiss.nextInt(7) - 3).toShort() } + speech
+            VoiceLog.add(this, "STT test: \"$text\" after $leadMs ms of quiet (${speech.size / 16} ms of speech, " +
+                "${intent.getStringExtra("lang") ?: "en-IN"})")
+            voice.listenToAudio(audio, intent.getStringExtra("lang"),
+                onResult = { heard -> VoiceLog.add(this, "STT test heard: \"${heard.text}\"") },
+                onError = { message -> VoiceLog.add(this, "STT test failed: $message") })
+        })
     }
 
     /** Launched as the system's digital assistant (long-press power / corner swipe): start a
@@ -460,11 +545,18 @@ class MainActivity : ComponentActivity() {
     private fun handleWakeIntent(intent: Intent?) {
         if (intent?.getBooleanExtra(WakeService.EXTRA_WAKE, false) != true) return
         intent.removeExtra(WakeService.EXTRA_WAKE)
+        // Each wake reaches us twice — a direct start and its full-screen notification, a moment
+        // apart. A second listen would cancel and restart the recognizer, which then hears nothing.
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - lastWakeAt < WAKE_REPEAT_MS) return
+        lastWakeAt = now
         screen = Screen.HOME // voice wake always lands on the orb
         speaker.stop() // barge-in: cut off whatever Naomi was saying
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
             == PackageManager.PERMISSION_GRANTED
         ) {
+            // The wake service only brings us up for the owner's voice (or anyone's, untrained).
+            trustNextSentence = true
             startListening()
         }
     }
@@ -661,6 +753,10 @@ class MainActivity : ComponentActivity() {
         /** Outcome of the last save/test, shown under the buttons. */
         val notice: String? = null,
         val testing: Boolean = false,
+        /** The user's SearXNG server, blank for DuckDuckGo; and the outcome of its last save/test. */
+        val searchUrl: String = "",
+        val searchNotice: String? = null,
+        val testingSearch: Boolean = false,
     ) {
         /** One line for the Settings screen. */
         val summary: String
@@ -676,6 +772,8 @@ class MainActivity : ComponentActivity() {
         val onSavePersona: (name: String, persona: String) -> Unit,
         val onResetPersona: () -> Unit,
         val onConversationToggle: (Boolean) -> Unit,
+        val onSaveSearch: (url: String) -> Unit,
+        val onTestSearch: (url: String) -> Unit,
     )
 
     private var brainUi by mutableStateOf(BrainUi())
@@ -688,6 +786,12 @@ class MainActivity : ComponentActivity() {
         onSavePersona = { name, persona -> savePersona(name, persona) },
         onResetPersona = { brain.settings.persona = ""; refreshBrainUi("✓ Personality reset") },
         onConversationToggle = { brain.settings.conversationMode = it; refreshBrainUi() },
+        onSaveSearch = { url ->
+            brain.settings.searchUrl = url
+            brainUi = brainUi.copy(searchUrl = brain.settings.searchUrl,
+                searchNotice = if (url.isBlank()) "✓ Saved — she'll search DuckDuckGo" else "✓ Saved")
+        },
+        onTestSearch = { url -> testSearch(url) },
     )
 
     private fun refreshBrainUi(notice: String? = null) {
@@ -703,7 +807,28 @@ class MainActivity : ComponentActivity() {
             persona = s.persona,
             conversation = s.conversationMode,
             notice = notice,
+            searchUrl = s.searchUrl,
         )
+    }
+
+    /** One search through the SearXNG on screen (saved or not), reporting how it went. */
+    private fun testSearch(url: String) {
+        if (url.isBlank()) {
+            brainUi = brainUi.copy(searchNotice = "✗ Add your SearXNG's address first.")
+            return
+        }
+        brainUi = brainUi.copy(testingSearch = true, searchNotice = null)
+        lifecycleScope.launch {
+            val started = System.currentTimeMillis()
+            val notice = try {
+                val results = SearchClient().trySearxng(url, "weather", VoiceInput.englishHere(this@MainActivity))
+                if (results.isEmpty()) "✗ It answered, but with no results — are its engines working?"
+                else "✓ ${results.size} results in ${System.currentTimeMillis() - started} ms"
+            } catch (e: Exception) {
+                "✗ ${e.message ?: e.javaClass.simpleName}"
+            }
+            brainUi = brainUi.copy(testingSearch = false, searchNotice = notice)
+        }
     }
 
     /** Saves the selected provider's fields; a blank [key] keeps the saved one. */
@@ -861,6 +986,8 @@ class MainActivity : ComponentActivity() {
             return
         }
         speaker.stop() // tapping also interrupts any ongoing speech
+        // Whoever unlocked the phone and tapped is taken to be the owner for this first sentence.
+        trustNextSentence = true
         startListening()
     }
 
@@ -886,19 +1013,39 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startListening() {
+        // Already on its way — waiting for the mic.
+        if (listenStarting?.isActive == true) return
         if (wakeEnabled) WakeService.pause(this) // free the mic from Vosk for this turn
         enterMood(Mood.LISTENING)
         status = "Listening…"
         // Get a local brain loading while the user speaks, not after.
         lifecycleScope.launch(Dispatchers.IO) { brain.warmUp() }
+        // The recognizer needs the mic to itself — Android silences it while the wake listener
+        // still records — so wait (briefly) for the pause to land.
+        listenStarting = lifecycleScope.launch {
+            val deadline = android.os.SystemClock.elapsedRealtime() + MIC_HANDOVER_MS
+            while (WakeService.micActive && android.os.SystemClock.elapsedRealtime() < deadline) delay(20)
+            // Names she knows, for the recognizer to listen out for (contacts are read off the main thread).
+            voice.vocabulary = withContext(Dispatchers.IO) { brain.vocabulary() }
+            if (mood == Mood.LISTENING) listenNow()
+        }
+    }
+
+    private fun listenNow() {
         voice.listen(
-            onResult = { spoken, audio ->
-                android.util.Log.d("Naomi", "Heard: \"$spoken\"")
+            onResult = { heard ->
+                val spoken = heard.text
+                android.util.Log.d("Naomi", "Heard: \"$spoken\"" +
+                    if (heard.alternatives.isEmpty()) "" else " (or: ${heard.alternatives.joinToString(" | ")})")
                 enterMood(Mood.THINKING)
-                lifecycleScope.launch { onHeard(spoken, identifySpeaker(audio)) }
+                val trusted = trustNextSentence
+                trustNextSentence = false
+                lifecycleScope.launch { onHeard(spoken, identifySpeaker(spoken, heard.audio, trusted), heard.alternatives) }
             },
             onError = { message ->
                 android.util.Log.e("Naomi", "STT error: $message")
+                VoiceLog.add(this, "Speech recognizer: $message")
+                trustNextSentence = false
                 enterMood(Mood.IDLE)
                 if (brain.hasPending) {
                     // Silence after Naomi spoke just ends the conversation — nothing to report,
@@ -947,15 +1094,46 @@ class MainActivity : ComponentActivity() {
     /**
      * Whose voice an utterance was, against the owner's voiceprint. UNKNOWN when there's no print
      * yet, or the speech service didn't let us hear the audio (then everyone is taken as before).
+     * A [trusted] sentence — the first of a turn the owner just opened — is theirs. Otherwise a
+     * noisy or short sentence that scores a little under the threshold is UNKNOWN, not someone
+     * else: noise pulls the owner's score down, and ignoring them in a street is worse than
+     * answering a passer-by.
      */
-    private suspend fun identifySpeaker(audio: ShortArray?): Who {
-        if (audio == null || !enrollment.isEnrolled) return Who.UNKNOWN
-        val sim = withContext(Dispatchers.Default) { enrollment.speakerSimilarity(audio) } ?: return Who.UNKNOWN
-        val owner = sim >= WakeService.similarityThreshold
-        android.util.Log.d("Naomi", "speaker similarity=${"%.3f".format(sim)} → ${if (owner) "owner" else "someone else"}")
+    private suspend fun identifySpeaker(spoken: String, audio: ShortArray?, trusted: Boolean): Who {
+        if (!enrollment.isEnrolled) return Who.UNKNOWN
+        val said = "\"${spoken.take(40)}${if (spoken.length > 40) "…" else ""}\""
+        if (audio == null) {
+            if (voice.speakerCheckSupported == true) VoiceLog.add(this, "$said: no audio for a voice check")
+            return if (trusted) Who.OWNER else Who.UNKNOWN
+        }
+        val check = withContext(Dispatchers.Default) { enrollment.speakerCheck(audio) }
+        if (check == null) {
+            VoiceLog.add(this, "$said: too little voice to check, taken as you")
+            return if (trusted) Who.OWNER else Who.UNKNOWN
+        }
+        val sim = check.similarity
+        val threshold = WakeService.similarityThreshold
+        val who = when {
+            trusted || sim >= threshold -> Who.OWNER
+            (check.noisy || check.short) && sim >= threshold - UNSURE_MARGIN -> Who.UNKNOWN
+            else -> Who.GUEST
+        }
+        val conditions = listOfNotNull(
+            check.snrDb?.let { "voice ${it.toInt()} dB over the background" },
+            "${"%.1f".format(check.voicedSeconds)} s of voice",
+        ).joinToString(", ")
+        VoiceLog.add(this, "$said: voice ${"%.2f".format(sim)} ($conditions) → " + when (who) {
+            Who.OWNER -> if (sim >= threshold) "you" else "you (turn just opened)"
+            Who.UNKNOWN -> "probably you, too noisy to be sure"
+            Who.GUEST -> "someone else"
+        })
+        android.util.Log.d("Naomi", "speaker similarity=${"%.3f".format(sim)} → $who")
+        VoiceDebug.keep(this, "sentence", audio, org.json.JSONObject().put("text", spoken).put("similarity", sim.toDouble())
+            .put("snr_db", check.snrDb ?: org.json.JSONObject.NULL).put("voiced_s", check.voicedSeconds)
+            .put("trusted", trusted).put("who", who.name).put("threshold", threshold.toDouble()))
         lastSpeakerSim = sim
         getSharedPreferences("naomi", MODE_PRIVATE).edit().putFloat(PREF_LAST_SPEAKER_SIM, sim).apply()
-        return if (owner) Who.OWNER else Who.GUEST
+        return who
     }
 
     /**
@@ -963,9 +1141,10 @@ class MainActivity : ComponentActivity() {
      * talking to the owner while they talk to her — is ignored, and she keeps listening for the
      * owner. A guest who addresses her by name ("Naomi, …") is answered, as a guest.
      */
-    private fun onHeard(spoken: String, who: Who) {
+    private fun onHeard(spoken: String, who: Who, heardAs: List<String> = emptyList()) {
         if (who == Who.GUEST && !Regex("\\bnaomi\\b", RegexOption.IGNORE_CASE).containsMatchIn(spoken)) {
             android.util.Log.d("Naomi", "Ignored someone else: \"$spoken\"")
+            VoiceLog.add(this, "Ignored: someone else, not talking to me")
             if (++ignoredInARow <= MAX_IGNORED_IN_A_ROW) {
                 status = "Listening for ${brain.memory.get("name") ?: "you"}…"
                 startListening()
@@ -990,7 +1169,7 @@ class MainActivity : ComponentActivity() {
             if (wakeEnabled) WakeService.resume(this)
             return
         }
-        route(spoken, lower, who)
+        route(spoken, lower, who, heardAs)
     }
 
     /** A follow-up answer was spoken over the question (caught by the AEC wake mic). */
@@ -1002,22 +1181,22 @@ class MainActivity : ComponentActivity() {
     }
 
     /** Routes a recognized command to screen-control, location-gated, or a normal turn. */
-    private fun route(spoken: String, lower: String, who: Who) {
+    private fun route(spoken: String, lower: String, who: Who, heardAs: List<String> = emptyList()) {
         // Driving other apps' screens is the owner's alone; a guest's words go to the brain.
         val screenCmd = if (who == Who.GUEST) null else parseScreenControl(lower)
         if (screenCmd != null) {
             performScreenControl(screenCmd)
             return
         }
-        if (needsLocation(lower)) ensureLocationOn { runTurn(spoken, who) } else runTurn(spoken, who)
+        if (needsLocation(lower)) ensureLocationOn { runTurn(spoken, who, heardAs) } else runTurn(spoken, who, heardAs)
     }
 
     /** Runs one assistant turn: think → act/answer → speak, re-arming wake afterward. */
-    private fun runTurn(spoken: String, who: Who = Who.UNKNOWN) {
+    private fun runTurn(spoken: String, who: Who = Who.UNKNOWN, heardAs: List<String> = emptyList()) {
         enterMood(Mood.THINKING)
         status = "Thinking…"
         turnJob = lifecycleScope.launch {
-            val reply = brain.handle(spoken, who)
+            val reply = brain.handle(spoken, who, heardAs)
             android.util.Log.d("Naomi", "Reply: \"${reply.text}\" (listenAgain=${reply.listenAgain})")
             transcript = "${if (who == Who.GUEST) "Guest" else "You"}: $spoken\n\nNaomi: ${reply.text}"
             if (reply.listenAgain) {
@@ -1086,7 +1265,8 @@ class MainActivity : ComponentActivity() {
         enterMood(Mood.LISTENING)
         status = "Say a fact — e.g. \"my mom is Amma\""
         voice.listen(
-            onResult = { spoken, _ ->
+            onResult = { heard ->
+                val spoken = heard.text
                 factMode = false
                 enterMood(Mood.SPEAKING)
                 val confirmation = brain.memory.learnFromSpeech(spoken)
@@ -1110,8 +1290,8 @@ class MainActivity : ComponentActivity() {
 
     /**
      * Guided voice training: the user says "Naomi" [ENROLL_CLIPS] times — WakeService spots each
-     * one and cuts it out exactly as it will at wake time — then talks freely for a few seconds,
-     * so any sentence can be told apart by voice too (see [recordFreeSpeech]).
+     * one and cuts it out exactly as it will at wake time. (Only "Naomi" is checked: sentences
+     * reach us without their audio — see VoiceInput — so a print of free speech would go unused.)
      */
     private fun trainVoice() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
@@ -1161,45 +1341,24 @@ class MainActivity : ComponentActivity() {
             speaker.speak("I didn't hear my name enough times. Let's try again later.") { enterMood(Mood.IDLE) }
             return
         }
-        stopEnrollment(resumeWake = false) // the mic is needed again for step 2
+        stopEnrollment(resumeWake = false) // back on once the voice is learned
         enterMood(Mood.THINKING)
         status = "Learning your voice…"
         lifecycleScope.launch {
             val outcome = withContext(Dispatchers.Default) { enrollment.enroll(clips) }
             voiceTrained = enrollment.isEnrolled
+            VoiceLog.add(this@MainActivity, outcome?.let {
+                "Training: ${it.clips} \"Naomi\"s, agreeing ${"%.2f".format(it.consistency)} on average, weakest " +
+                    "${"%.2f".format(it.weakest)}" + if (it.dropped > 0) " (${it.dropped} left out: silence, not voice)" else ""
+            } ?: "Training failed: too few usable \"Naomi\"s")
             enterMood(Mood.SPEAKING)
             if (outcome == null) {
                 status = "Training failed, try again"
                 speaker.speak("Sorry, I couldn't learn your voice. Please try again.") { enterMood(Mood.IDLE) }
-                if (wakeEnabled) WakeService.resume(this@MainActivity) else WakeService.stop(this@MainActivity)
             } else {
-                status = "Now just talk to me for a bit"
-                // The prompt ends before recording starts, so Naomi's own voice isn't captured.
-                speaker.speak("Got it. Now just talk to me for about fifteen seconds, about anything, like how your day's going.") {
-                    recordFreeSpeech()
-                }
+                status = "Voice trained ✓ — only you can wake me"
+                speaker.speak("Perfect. I know your voice now. I'll only wake up for you.") { enterMood(Mood.IDLE) }
             }
-        }
-    }
-
-    /**
-     * Voice training, step 2: ~15 s of the owner talking about anything. Commands are checked
-     * against this print — it covers how they sound in any sentence, not just saying "Naomi".
-     */
-    private fun recordFreeSpeech() {
-        enterMood(Mood.LISTENING)
-        status = "Keep talking… (15 s)"
-        lifecycleScope.launch {
-            val audio = withContext(Dispatchers.IO) { recordMic(FREE_SPEECH_MS) }
-            enterMood(Mood.THINKING)
-            status = "Learning your voice…"
-            val learned = withContext(Dispatchers.Default) { enrollment.enrollSpeech(audio) }
-            enterMood(Mood.SPEAKING)
-            status = "Voice trained ✓ — only you can wake me"
-            speaker.speak(
-                if (learned) "Perfect. I know your voice now. I'll only answer to you, and I'll know when it's someone else talking."
-                else "I didn't catch much there, but I know your voice from my name. You can train again any time."
-            ) { enterMood(Mood.IDLE) }
             if (wakeEnabled) WakeService.resume(this@MainActivity) else WakeService.stop(this@MainActivity)
         }
     }
@@ -1226,6 +1385,7 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         runCatching { unregisterReceiver(screenOffReceiver) }
         if (brain.memories.onChange === memoriesChanged) brain.memories.onChange = null
+        if (VoiceLog.onChange === voiceLogChanged) VoiceLog.onChange = null
         // The conversation in progress still gets noted down.
         brain.cancel()
         voice.destroy()
@@ -1291,6 +1451,8 @@ private fun NaomiApp(
     lastSimAt: Long,
     lastSpeakerSim: Float,
     speakerCheck: Boolean?,
+    voiceLog: List<String>,
+    onClearVoiceLog: () -> Unit,
     onThresholdChange: (Float) -> Unit,
     onNavigate: (MainActivity.Screen) -> Unit,
     onOrbTap: () -> Unit,
@@ -1360,6 +1522,8 @@ private fun NaomiApp(
                     lastSimAt = lastSimAt,
                     lastSpeakerSim = lastSpeakerSim,
                     speakerCheck = speakerCheck,
+                    voiceLog = voiceLog,
+                    onClearVoiceLog = onClearVoiceLog,
                     onThresholdChange = onThresholdChange,
                     onBack = { onNavigate(MainActivity.Screen.HOME) },
                     onWakeToggle = onWakeToggle,
@@ -1832,6 +1996,8 @@ private fun SettingsScreen(
     lastSimAt: Long,
     lastSpeakerSim: Float,
     speakerCheck: Boolean?,
+    voiceLog: List<String>,
+    onClearVoiceLog: () -> Unit,
     onThresholdChange: (Float) -> Unit,
     onBack: () -> Unit,
     onWakeToggle: () -> Unit,
@@ -1910,6 +2076,7 @@ private fun SettingsScreen(
                 speakerCheck = speakerCheck,
                 onThresholdChange = onThresholdChange
             )
+            VoiceLogCard(lines = voiceLog, onClear = onClearVoiceLog)
 
             Spacer(Modifier.height(8.dp))
             SectionLabel("Setup — permissions Naomi needs")
@@ -1988,6 +2155,7 @@ private fun BrainScreen(
     var key by remember(ui.provider) { mutableStateOf("") }
     var model by remember(ui.provider, ui.model) { mutableStateOf(ui.model) }
     var baseUrl by remember(ui.baseUrl) { mutableStateOf(ui.baseUrl) }
+    var searchUrl by remember(ui.searchUrl) { mutableStateOf(ui.searchUrl) }
     var name by remember(ui.userName) { mutableStateOf(ui.userName) }
     var persona by remember(ui.persona) { mutableStateOf(ui.persona) }
     // Keys, model ids and URLs: no auto-capitalisation or autocorrect.
@@ -2093,6 +2261,35 @@ private fun BrainScreen(
             }
 
             Spacer(Modifier.height(8.dp))
+            SectionLabel("Looking things up")
+            NaomiTextField(searchUrl, { searchUrl = it }, "SearXNG server (optional)", keyboardOptions = plain)
+            Text(
+                "In smart mode she answers questions about news, scores, prices and the like by searching first. " +
+                    "Your own SearXNG with JSON output on, e.g. http://<pc>.<tailnet>.ts.net:8888. Blank, or when " +
+                    "it can't be reached, she searches DuckDuckGo from the phone.",
+                fontFamily = InterFamily, fontSize = 12.sp,
+                color = OnSurfaceVariant.copy(alpha = 0.6f)
+            )
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                PillButton(
+                    text = "Save", icon = Icons.Outlined.Check, accent = SuccessGreen,
+                    modifier = Modifier.weight(1f)
+                ) { actions.onSaveSearch(searchUrl) }
+                PillButton(
+                    text = if (ui.testingSearch) "Testing…" else "Test", icon = Icons.Outlined.GraphicEq,
+                    accent = CyanAccent, modifier = Modifier.weight(1f), filled = false,
+                    enabled = !ui.testingSearch
+                ) { actions.onTestSearch(searchUrl) }
+            }
+            ui.searchNotice?.let { notice ->
+                Text(
+                    notice,
+                    fontFamily = InterFamily, fontSize = 13.sp,
+                    color = if (notice.startsWith("✓")) SuccessGreen else RecordingRed
+                )
+            }
+
+            Spacer(Modifier.height(8.dp))
             SectionLabel("Personality")
             NaomiTextField(name, { name = it }, "What should Naomi call you?")
             NaomiTextField(persona, { persona = it }, "Who Naomi is", singleLine = false)
@@ -2116,7 +2313,8 @@ private fun BrainScreen(
             )
             Text(
                 "In smart mode, what you say, the recent conversation, your saved facts and the memories " +
-                    "related to it go to ${ui.provider.label}. With it off, nothing leaves the phone.",
+                    "related to it go to ${ui.provider.label}, and what she looks up goes to your SearXNG or DuckDuckGo. " +
+                    "With it off, nothing leaves the phone.",
                 fontFamily = InterFamily, fontSize = 12.sp,
                 color = OnSurfaceVariant.copy(alpha = 0.55f)
             )
@@ -2324,6 +2522,59 @@ private fun VoiceMatchCard(
             },
             fontFamily = InterFamily, fontSize = 12.sp, color = OnSurfaceVariant.copy(alpha = 0.7f)
         )
+    }
+}
+
+/**
+ * What the voice pipeline did lately, newest first: each "Naomi" heard or passed over and why,
+ * each voice check's score, each sentence answered or ignored, recognizer errors. When she
+ * doesn't respond somewhere, this says which step dropped it.
+ */
+@Composable
+private fun VoiceLogCard(lines: List<String>, onClear: () -> Unit) {
+    var showAll by remember { mutableStateOf(false) }
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .background(GlassFill, RoundedCornerShape(16.dp))
+            .border(1.dp, GlassBorder, RoundedCornerShape(16.dp))
+            .padding(16.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            RowIcon(Icons.Outlined.RecordVoiceOver, PrimaryViolet)
+            Spacer(Modifier.width(14.dp))
+            Column(Modifier.weight(1f)) {
+                Text("Voice log", fontFamily = SpaceGrotesk, fontWeight = FontWeight.Medium, fontSize = 15.sp, color = OnSurface)
+                Text("What happened to each \"Naomi\" and sentence", fontFamily = InterFamily, fontSize = 12.sp, color = OnSurfaceVariant.copy(alpha = 0.6f))
+            }
+            if (lines.isNotEmpty()) {
+                Text(
+                    "Clear", fontFamily = InterFamily, fontSize = 13.sp, color = OutlineColor,
+                    modifier = Modifier.clickable(onClick = onClear).padding(8.dp)
+                )
+            }
+        }
+        Spacer(Modifier.height(10.dp))
+        if (lines.isEmpty()) {
+            Text(
+                "Nothing yet. Say \"Naomi\" and what happens shows up here.",
+                fontFamily = InterFamily, fontSize = 12.sp, color = OnSurfaceVariant.copy(alpha = 0.55f)
+            )
+        } else {
+            (if (showAll) lines else lines.take(12)).forEach { line ->
+                Text(
+                    line, fontFamily = FontFamily.Monospace, fontSize = 11.sp, lineHeight = 15.sp,
+                    color = OnSurfaceVariant.copy(alpha = 0.85f), modifier = Modifier.padding(vertical = 2.dp)
+                )
+            }
+            if (lines.size > 12) {
+                Text(
+                    if (showAll) "Show less" else "Show all ${lines.size}",
+                    fontFamily = InterFamily, fontSize = 13.sp, color = CyanAccent,
+                    modifier = Modifier.clickable { showAll = !showAll }.padding(vertical = 8.dp)
+                )
+            }
+        }
     }
 }
 

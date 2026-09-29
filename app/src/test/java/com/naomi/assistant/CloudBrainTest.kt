@@ -88,6 +88,22 @@ class CloudBrainTest {
     }
 
     @Test
+    fun nearestPlacesAreSaidPlainly() {
+        assertEquals("Iris Street opposite Patanga Road", DistanceClient.spelledOut("Iris St Opp Patanga Rd"))
+        assertEquals("Mona Vale Road at Saint Ives Station", DistanceClient.spelledOut("Mona Vale Rd at St Ives Station"))
+        // A chain store is known by the shopping centre it's in — not the lane behind the car park.
+        assertEquals("the Woolworths at Forestway Shopping Centre",
+            DistanceClient.spokenPlace("Woolworths", "Forestway Shopping Centre", null, "Sorlie Place", "woolworths"))
+        assertEquals("the Woolworths in Belrose", DistanceClient.spokenPlace("Woolworths", null, "Belrose", "Glenrose Place", "Woolworths"))
+        assertEquals("the bus stop on Forest Way", DistanceClient.spokenPlace("", null, null, "Forest Way", "the closest bus stop"))
+        assertEquals("The nearest bus stop is Iris Street opposite Patanga Road, about 600 metres away, around an 8-minute walk.",
+            DistanceClient.nearestSentence("bus stop", "Iris Street opposite Patanga Road", 0.616, 8, onFoot = true))
+        assertEquals("The nearest Woolworths is the Woolworths on Glenrose Place, about 2.9 kilometres away by road, around 6 minutes by car.",
+            DistanceClient.nearestSentence("Woolworths", "the Woolworths on Glenrose Place", 2.94, 6, onFoot = false))
+        assertEquals("bus stop", DistanceClient.kindOf("the closest bus stop"))
+    }
+
+    @Test
     fun ramblingIsCutAtASentenceEnd() {
         val long = "Octopuses are clever. ".repeat(40)
         val spoken = CloudBrain.cleanSpeech(long)
@@ -147,6 +163,14 @@ class CloudBrainTest {
             assertTrue(prompt.contains("- Ozzy is vegetarian\n"))
             assertTrue(prompt.contains("- Yesterday: Ozzy was nervous about his interview."))
         }
+    }
+
+    @Test
+    fun theRecognizersOtherGuessesReachTheBrain() {
+        val ctx = TurnContext(mapOf("name" to "Ozzy"), heardAs = listOf("how can I get to the closest Woolworths by bus"))
+        val prompt = CloudBrain.systemPrompt("You are Naomi.", ctx, Date(0))
+        assertTrue(prompt.contains("Its other guesses: \"how can I get to the closest Woolworths by bus\""))
+        assertFalse(CloudBrain.systemPrompt("You are Naomi.", TurnContext(mapOf("name" to "Ozzy")), Date(0)).contains("other guesses"))
     }
 
     @Test

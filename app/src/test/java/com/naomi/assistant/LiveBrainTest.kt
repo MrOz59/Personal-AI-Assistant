@@ -45,6 +45,8 @@ class LiveBrainTest {
             "wake me up at 6:30 tomorrow" to "set_alarm",
             "play Blinding Lights" to "play_music",
             "how far away am I from Riverside" to "distance",
+            "where's the closest woolworths" to "nearest",
+            "how far away am I from the closest bus stop" to "nearest",
         )
         var actionOk = 0
         for ((utterance, expected) in cases) {
@@ -185,6 +187,88 @@ class LiveBrainTest {
             val ms = (System.nanoTime() - started) / 1_000_000
             println("[${ms}ms] You: $line")
             println("        Naomi: ${reply.say}${reply.action?.let { "  [action $it]" } ?: ""}")
+        }
+    }
+
+    /** Misheard sentences, with the recognizer's runner-up guesses: does the brain pick the right one? */
+    @Test
+    fun misheardWithOtherGuesses() {
+        val brain = CloudBrain(liveClient() ?: return, BrainSettings.DEFAULT_PERSONA)
+        for ((heard, others) in listOf(
+            "how can I get to the closest work by bus" to listOf("how can I get to the closest Woolworths by bus", "how can I get to the closest walk by bus"),
+            "do the woolsworth" to listOf("to the Woolworths", "do the Woolworths"),
+            "set a timer for fifteen minutes" to listOf("set a timer for fifty minutes"),
+            "call my mum" to listOf("call my mom", "cool my mum"),
+        )) {
+            val reply = runBlocking { brain.respond(heard, emptyList(), TurnContext(mapOf("name" to "Ozzy"), heardAs = others)) }
+            println("heard \"$heard\" (or: ${others.joinToString(" | ")})")
+            println("        action: ${reply.action ?: "none"}   say: ${reply.say.take(100)}")
+        }
+    }
+
+    /** Questions that need a search, and ones that don't: does the brain reach for "look_up", with a query that stands alone? */
+    @Test
+    fun lookUpDecisions() {
+        val brain = CloudBrain(liveClient() ?: return, BrainSettings.DEFAULT_PERSONA)
+        val cases = listOf(
+            "who won the NRL grand final this year?" to "look_up",
+            "what's the price of gold today" to "look_up",
+            "is Bunnings open on public holidays?" to "look_up",
+            "search for the best pizza in town" to "look_up",
+            "google how tall Mount Everest is" to "look_up",
+            "when is the next iPhone coming out" to "look_up",
+            "who's the prime minister of Japan right now" to "look_up",
+            "open google and search for cheap flights" to "web_search",
+            "why do cats purr?" to null,
+            "tell me a joke" to null,
+        )
+        var ok = 0
+        for ((utterance, expected) in cases) {
+            val reply = runBlocking { brain.respond(utterance, emptyList(), TurnContext(mapOf("name" to "Ozzy"))) }
+            val got = reply.action?.optString("type")
+            if (got == expected) ok++
+            println("${if (got == expected) "OK " else "BAD"} \"$utterance\" → ${reply.action ?: "say: ${reply.say.take(90)}"}")
+        }
+        // A follow-up: the query has to name what "they" are.
+        val history = listOf("who won the NRL grand final last year?" to "The Brisbane Broncos, 26 to 22 over the Storm.")
+        val followUp = runBlocking { brain.respond("when do they play next?", history, TurnContext(mapOf("name" to "Ozzy"))) }
+        println("follow-up \"when do they play next?\" → ${followUp.action ?: "say: ${followUp.say.take(90)}"}")
+        println("SUMMARY: $ok/${cases.size}")
+    }
+
+    /**
+     * Real searches answered from their results: NAOMI_SEARCH_URL is a SearXNG (blank: DuckDuckGo).
+     * Prints each answer, how long it took, and whether it held up (null: a number it made up).
+     */
+    @Test
+    fun answersFromSearch() {
+        val client = liveClient() ?: return
+        val brain = CloudBrain(client, BrainSettings.DEFAULT_PERSONA)
+        val search = SearchClient()
+        for ((asked, query) in listOf(
+            "who won the NRL grand final last year?" to "2025 NRL grand final winner",
+            "who won the 2025 NRL grand final?" to "2025 NRL grand final winner",
+            "what's bitcoin worth right now?" to "bitcoin price",
+            "when's the next full moon?" to "next full moon date",
+            "who's the prime minister of Japan right now?" to "current prime minister of Japan",
+            "what's the capital of the moon?" to "capital of the moon",
+        )) {
+            val started = System.nanoTime()
+            val found = runBlocking { search.search(query, System.getenv("NAOMI_SEARCH_URL").orEmpty(), "en-AU") }
+            val searched = (System.nanoTime() - started) / 1_000_000
+            if (found == null) { println("\"$asked\": no results"); continue }
+            val answer = runBlocking { brain.answerFrom(asked, query, found.results, emptyList(), TurnContext(mapOf("name" to "Ozzy"))) }
+            val total = (System.nanoTime() - started) / 1_000_000
+            println("\"$asked\" [${found.source}, search ${searched}ms, total ${total}ms]")
+            println("        ${answer ?: "REJECTED (or unreachable)"}")
+            if (answer == null) {
+                // Why: the same request again, raw.
+                val ctx = TurnContext(mapOf("name" to "Ozzy"))
+                val raw = client.complete(CloudBrain.answerPrompt(BrainSettings.DEFAULT_PERSONA, ctx, Date()),
+                    listOf(Turn(fromUser = true, text = CloudBrain.searchTurn(asked, query, found.results, Date()))), creative = true)
+                println("        raw retry: $raw")
+                found.results.forEach { println("          - ${it.title}: ${it.snippet.take(140)}") }
+            }
         }
     }
 

@@ -1,13 +1,10 @@
 package com.naomi.assistant
 
-import android.annotation.SuppressLint
-import android.media.AudioFormat
-import android.media.AudioRecord
-import android.media.MediaRecorder
+import kotlin.math.log10
 import kotlin.math.sqrt
 
-// Small audio helpers shared by the wake listener, the ears and voice training. The voice
-// detection is plain energy against the room's own background — no model, no deps.
+// Small audio helpers shared by the wake listener and the voice checks. The voice detection
+// is plain energy against the room's own background — no model, no deps.
 
 /** RMS loudness of each 20 ms frame of [audio]. */
 private fun frameLoudness(audio: ShortArray, frame: Int): DoubleArray =
@@ -26,8 +23,9 @@ private fun voiceThreshold(loudness: DoubleArray, fraction: Double): Double? {
     val sorted = loudness.sorted()
     val floor = sorted[loudness.size / 5]
     val peak = sorted.last()
-    // Too little contrast (or too quiet overall) to call anything speech.
-    if (peak < floor * 3 || peak < 200.0) return null
+    // Too little contrast (or too quiet overall) to call anything speech. The absolute floor is
+    // low: this mic source has no gain control, and a softly spoken word can peak under 200.
+    if (peak < floor * 3 || peak < 60.0) return null
     return floor + (peak - floor) * fraction
 }
 
@@ -41,6 +39,20 @@ internal fun lastSpeechEnd(audio: ShortArray, sampleRate: Int): Int? {
     val threshold = voiceThreshold(loudness, 0.2) ?: return null
     for (f in loudness.indices.reversed()) if (loudness[f] > threshold) return (f + 1) * frame
     return null
+}
+
+/**
+ * How far the voice stands out from the background in [audio], in dB: its loud frames against its
+ * quiet ones. Around 30 dB or more in a quiet room; below about 15 dB, the street is nearly as
+ * loud as the voice. Null for audio too short to tell.
+ */
+internal fun snrDb(audio: ShortArray, sampleRate: Int): Double? {
+    val loudness = frameLoudness(audio, sampleRate / 50)
+    if (loudness.size < 5) return null
+    val sorted = loudness.sorted()
+    val background = sorted[loudness.size / 5].coerceAtLeast(1.0)
+    val voice = sorted[loudness.size * 19 / 20]
+    return 20 * log10(maxOf(voice, background) / background)
 }
 
 /**
@@ -58,31 +70,4 @@ internal fun trimToSpeech(audio: ShortArray, sampleRate: Int): ShortArray {
     val out = ShortArray(keep.size * frame)
     keep.forEachIndexed { i, f -> System.arraycopy(audio, f * frame, out, i * frame, frame) }
     return out
-}
-
-/**
- * Records [millis] of 16 kHz mono mic audio, blocking — call off the main thread, with the mic
- * free (wake listening paused). Used for the free-speech step of voice training.
- */
-@SuppressLint("MissingPermission") // only called after RECORD_AUDIO is granted
-internal fun recordMic(millis: Int, sampleRate: Int = 16000): ShortArray {
-    val record = AudioRecord(
-        MediaRecorder.AudioSource.VOICE_RECOGNITION, sampleRate,
-        AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT,
-        maxOf(AudioRecord.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT), sampleRate)
-    )
-    val out = ShortArray(sampleRate * millis / 1000)
-    return try {
-        record.startRecording()
-        var filled = 0
-        while (filled < out.size) {
-            val n = record.read(out, filled, out.size - filled)
-            if (n <= 0) break
-            filled += n
-        }
-        out.copyOf(filled)
-    } finally {
-        runCatching { record.stop() }
-        record.release()
-    }
 }
