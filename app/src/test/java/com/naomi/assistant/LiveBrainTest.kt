@@ -272,6 +272,27 @@ class LiveBrainTest {
         }
     }
 
+    /** Weather asked in Portuguese, where a question reads like a statement: does it reach for "weather"? */
+    @Test
+    fun portugueseWeather() {
+        val brain = CloudBrain(liveClient() ?: return, BrainSettings.DEFAULT_PERSONA)
+        val ctx = TurnContext(mapOf("name" to "Ozzy"), language = Language.PORTUGUESE)
+        var ok = 0
+        val cases = listOf("Vai chover amanhã", "tá frio hoje", "vai fazer sol no sábado", "como tá o tempo lá fora",
+            "me conta uma piada", "estou cansado hoje")
+        for (utterance in cases) {
+            val reply = runBlocking { brain.respond(utterance, emptyList(), ctx) }
+            val weather = reply.action?.optString("type") == "weather"
+            if (weather == (cases.indexOf(utterance) < 4)) ok++
+            println("\"$utterance\" → ${reply.action ?: "say: ${reply.say.take(100)}"}")
+        }
+        // The follow-up that went wrong: correcting her after she took the question for a statement.
+        val history = listOf("Vai chover amanhã" to "Parece que você está preparado para a chuva de amanhã. Tem algum plano?")
+        val followUp = runBlocking { brain.respond("mas foi uma pergunta", history, ctx) }
+        println("follow-up \"mas foi uma pergunta\" → ${followUp.action ?: "say: ${followUp.say.take(100)}"}")
+        println("SUMMARY: $ok/${cases.size}")
+    }
+
     /** The brain from NAOMI_LLM_URL / _MODEL / _KEY, or null (test skipped) when it isn't set. */
     private fun liveClient(): LlmClient? {
         val url = System.getenv("NAOMI_LLM_URL")

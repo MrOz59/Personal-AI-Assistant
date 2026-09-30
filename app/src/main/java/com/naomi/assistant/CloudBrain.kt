@@ -96,7 +96,8 @@ class CloudBrain(private val llm: LlmClient, private val persona: String) {
     /**
      * Passes on a result the phone produced — the weather, a distance, a timer set — in her own
      * voice instead of the bare report. Null (so the plain [fact] is spoken) if the brain can't
-     * be reached, or if the wording dropped or changed any number from the fact.
+     * be reached, or if the wording dropped or changed any number from the fact or said the
+     * opposite about rain, twice.
      */
     suspend fun narrate(
         userText: String,
@@ -104,13 +105,18 @@ class CloudBrain(private val llm: LlmClient, private val persona: String) {
         history: List<Pair<String, String>>,
         ctx: TurnContext,
     ): String? = withContext(Dispatchers.IO) {
-        val said = try {
-            cleanSpeech(llm.complete(narrationPrompt(persona, ctx, Date(), fact), plainTurns(history, userText), creative = true))
-        } catch (e: LlmException) {
-            return@withContext null
+        // Lively first; if that drops or changes a number, once more at a steadier temperature
+        // before the plain report — which, for some results, is only in English.
+        for (creative in listOf(true, false)) {
+            val said = try {
+                cleanSpeech(llm.complete(narrationPrompt(persona, ctx, Date(), fact), plainTurns(history, userText), creative = creative))
+            } catch (e: LlmException) {
+                return@withContext null
+            }
+            android.util.Log.d("Naomi", "Cloud narration: $said")
+            if (said.isNotBlank() && keepsNumbers(fact, said) && agreesOnRain(fact, said)) return@withContext said
         }
-        android.util.Log.d("Naomi", "Cloud narration: $said")
-        said.takeIf { it.isNotBlank() && keepsNumbers(fact, it) }
+        null
     }
 
     /**
@@ -578,6 +584,26 @@ class CloudBrain(private val llm: LlmClient, private val persona: String) {
         }
 
         /**
+         * Whether a retelling of a weather [fact] says what it says about rain: no "vai chover" when
+         * none is expected, no "no rain" when a lot is. "Will it rain?" is what people ask, and a
+         * small model answers it from the question rather than the forecast.
+         */
+        fun agreesOnRain(fact: String, said: String): Boolean {
+            val dry = DRY.containsMatchIn(fact)
+            val wet = Regex("(\\d+) (percent|por cento) (chance|de chance) (of|de) (rain|chuva)").find(fact)
+                ?.groupValues?.get(1)?.toInt()?.let { it >= 50 } == true
+            // Rain said to be coming: a mention with no "no", "não", "sem", "won't" just before it.
+            val saysRain = RAIN_SAID.findAll(said).any { m -> !NEGATED.containsMatchIn(said.substring(maxOf(0, m.range.first - 16), m.range.first)) }
+            return !(dry && saysRain) && !(wet && DRY_SAID.containsMatchIn(said))
+        }
+
+        private val DRY = wordRegex("\\b(no rain expected|sem previsão de chuva)\\b")
+        private val RAIN_SAID = wordRegex("\\b(vai chover|vão chover|chover[áa]|vai ter chuva|expectativa de chuva|previsão de chuva|" +
+            "chance de chuva|will rain|going to rain|expect(ing)? rain|rain is (coming|expected)|chance of rain)\\b")
+        private val NEGATED = wordRegex("\\b(não|nao|sem|nenhuma|no|not|won'?t|without)\\b")
+        private val DRY_SAID = wordRegex("\\b(não vai chover|sem chuva|sem previsão de chuva|no rain|won'?t rain|not going to rain|stay dry)\\b")
+
+        /**
          * Whether a retelling of [fact] can be trusted: every number it states — in digits or
          * words — is one the fact gave (rounding allowed), and it keeps the fact's first,
          * headline number. Details may be dropped; nothing may be invented or changed.
@@ -662,6 +688,13 @@ class CloudBrain(private val llm: LlmClient, private val persona: String) {
                 appendLine("- Keep a message's words exactly as they said them.")
                 appendLine("- Speech recognition mishears names and songs; fix obvious mistakes.")
                 appendLine("- For weather with no city named, leave \"city\" empty — the phone knows where it is.")
+                if (ctx.language == Language.PORTUGUESE) {
+                    // Brazilian Portuguese asks yes/no questions in a statement's words, and the
+                    // recognizer seldom adds the question mark: "vai chover amanhã" got a forecast made up.
+                    appendLine("- In Portuguese a question often reads like a statement: \"vai chover amanhã\" asks whether " +
+                        "it will rain tomorrow. Treat it as the question it is. Action fields stay in English " +
+                        "(\"day\": \"tomorrow\", \"mode\": \"walk\").")
+                }
                 appendLine()
                 appendLine("REPLY FORMAT")
                 appendLine("Reply with one JSON object and nothing else:")
@@ -670,6 +703,7 @@ class CloudBrain(private val llm: LlmClient, private val persona: String) {
                 appendLine()
                 appendLine("EXAMPLES")
                 EXAMPLES.forEach { (user, reply) -> appendLine("\"$user\" → $reply") }
+                if (ctx.language == Language.PORTUGUESE) EXAMPLES_PT.forEach { (user, reply) -> appendLine("\"$user\" → $reply") }
                 // Dated from today, so a model that copies it still has the right day.
                 val tomorrow = SimpleDateFormat("yyyy-MM-dd", Locale.ENGLISH).format(Date(now.time + 86_400_000L))
                 appendLine("\"remind me to call the dentist tomorrow at 9\" → {\"action\": {\"type\":\"reminder\",\"text\":\"call the dentist\"," +
@@ -679,6 +713,12 @@ class CloudBrain(private val llm: LlmClient, private val persona: String) {
 
         // Few-shot pairs: big models barely need them, small local ones lean on them heavily —
         // for the format and actions, and for how much personality a reply carries.
+        // For Portuguese: its questions that read like statements, with the action's fields in English.
+        private val EXAMPLES_PT = listOf(
+            "vai chover amanhã" to """{"action": {"type":"weather","city":"","day":"tomorrow"}, "say": ""}""",
+            "tá frio lá fora?" to """{"action": {"type":"weather","city":"","day":"today"}, "say": ""}""",
+        )
+
         private val EXAMPLES = listOf(
             "how's your day going?" to """{"action": null, "say": "Quiet so far, which suits me fine. How about yours — anything fun, or one of those days?"}""",
             "tell me a joke" to """{"action": null, "say": "I told my wifi we needed some space. Now it won't connect with me. Too soon?"}""",

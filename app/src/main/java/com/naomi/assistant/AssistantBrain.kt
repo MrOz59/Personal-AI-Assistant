@@ -244,7 +244,7 @@ class AssistantBrain(context: Context) {
         if (!guest) memoryCommand(userText)?.let { return it }
 
         // 2a. WEATHER: needs a live network lookup (async), so it can't live in the sync router.
-        if (Regex("\\b(weather|temperature|forecast)\\b").containsMatchIn(lower)) {
+        if (Regex("\\b(weather|temperature|forecast)\\b").containsMatchIn(lower) || WEATHER_PT.containsMatchIn(lower)) {
             return Reply(weatherReport(extractCity(userText), WeatherClient.dayOffset(userText)))
         }
 
@@ -512,7 +512,10 @@ class AssistantBrain(context: Context) {
         val lower = userText.lowercase()
         val guest = speaker == Who.GUEST
         val asking = Regex("\\b(what|what's|how|how's|how much|is it|will it|tell me|check|any|do i)\\b").containsMatchIn(lower)
-        if (asking && Regex("\\b(weather|forecast|temperature)\\b").containsMatchIn(lower)) {
+        // "Will it rain tomorrow?" — and "vai chover amanhã", which in Portuguese asks it with no
+        // question word, and often no question mark from the recognizer either.
+        if ((asking && Regex("\\b(weather|forecast|temperature|rain|raining|rainy|umbrella|sunny|snow)\\b").containsMatchIn(lower)) ||
+            WEATHER_PT.containsMatchIn(lower)) {
             return Reply(weatherReport(extractCity(userText), WeatherClient.dayOffset(userText)))
         }
         if (asking && Regex("\\bbattery\\b").containsMatchIn(lower)) {
@@ -813,9 +816,10 @@ class AssistantBrain(context: Context) {
      * the saved home city, else she asks which city.
      */
     private suspend fun weatherReport(city: String, day: Int): String {
-        if (city.isNotBlank()) return weather.forecast(city, day)
+        val pt = Language.current(appContext) == Language.PORTUGUESE
+        if (city.isNotBlank()) return weather.forecast(city, day, pt = pt)
         val here = DeviceLocation.current(appContext)
-        return weather.forecast(if (here == null) homeCity().orEmpty() else "", day, here)
+        return weather.forecast(if (here == null) homeCity().orEmpty() else "", day, here, pt)
     }
 
     /** Words after "in/at/for", stripped of weather/time filler — the city for a weather query. */
@@ -884,8 +888,13 @@ class AssistantBrain(context: Context) {
             return forgetReply(args.optString("what"), fromModel = true) ?: Reply("Okay.")
         }
         if (type == "weather") {
-            // A day the user actually said wins over the model's reading of it.
-            val day = WeatherClient.dayOffset(original).takeIf { it != 0 } ?: WeatherClient.dayOffset(args.optString("day"))
+            // A day the user actually said wins over the model's reading of it. A day the model
+            // garbled ("amãhem") in a follow-up ("but that was a question") is the one they asked about.
+            val modelDay = args.optString("day").trim()
+            val day = WeatherClient.dayNamed(original)
+                ?: WeatherClient.dayNamed(modelDay)
+                ?: modelDay.takeIf { it.isNotEmpty() }?.let { history.lastOrNull()?.first?.let(WeatherClient::dayNamed) }
+                ?: 0
             return Reply(join(say, weatherReport(args.optString("city"), day)))
         }
         val result = when (type) {
@@ -1024,6 +1033,13 @@ class AssistantBrain(context: Context) {
             "july", "august", "september", "october", "november", "december")
         // What she says as she starts looking something up, so the wait isn't silent.
         private val LOOKING = listOf("Let me check.", "One sec, I'll look it up.", "Hang on, let me look.", "Checking now.")
+        // Weather asked in Portuguese, question or not: "vai chover amanhã", "tá frio hoje?", "como tá o
+        // tempo", "previsão do tempo". Rain or cold with nothing about now or later ("adoro dias de
+        // chuva") isn't a question about the weather.
+        internal val WEATHER_PT = wordRegex("\\b(previs[ãa]o do tempo|como (est[áa]|t[áa]|vai estar|vai ficar) o tempo|" +
+            "(vai|vão|será|sera|tá|ta|está|esta|deve) (chover|chovendo|garoar|nevar|fazer (frio|calor|sol)|esfriar|esquentar|" +
+            "estar (frio|quente|chovendo|nublado))|temperatura (hoje|amanh[ãa]|agora|l[áa] fora)|" +
+            "(chove|chuva|frio|calor) (hoje|amanh[ãa]|agora|essa semana|nesse fim de semana))\\b")
         private val LOOKING_PT = listOf("Deixa eu ver.", "Um segundo, vou pesquisar.", "Peraí, vou dar uma olhada.", "Vou pesquisar.")
 
         private fun lookingLine(language: Language) = (if (language == Language.PORTUGUESE) LOOKING_PT else LOOKING).random()
