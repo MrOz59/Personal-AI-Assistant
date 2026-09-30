@@ -516,8 +516,8 @@ class CloudBrain(private val llm: LlmClient, private val persona: String) {
         private fun word(token: String) = token.lowercase(Locale.ROOT).trim { !it.isLetterOrDigit() }.removeSuffix("'s").removeSuffix("’s")
 
         // The recent exchanges an answer from search results sees: enough for a follow-up, and
-        // short enough that a small model's context still has room for the results.
-        private const val ANSWER_HISTORY = 3
+        // short enough that a small model's context still has plenty of room for the results.
+        private const val ANSWER_HISTORY = 6
 
         // Whether it answered decides whether she offers to open the search, so it comes first; her
         // own comment is kept apart from the facts, where it can be checked for made-up ones.

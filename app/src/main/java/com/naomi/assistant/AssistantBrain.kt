@@ -68,7 +68,9 @@ class AssistantBrain(context: Context) {
 
     // Rolling conversation memory (user, naomi) so follow-ups and chat stay in context.
     private val history = ArrayDeque<Pair<String, String>>()
-    private val maxHistory = 10
+    // With the decision prompt's ~2,400 tokens, 20 exchanges come to ~4,400: sized for a brain
+    // with an 8K context (Ollama's default is 4K — see the README).
+    private val maxHistory = 20
 
     // The conversation so far as the owner had it — for its note when it ends — and whether any
     // of it was real talk rather than quick commands. [chatTurn] marks the turn in progress as talk.

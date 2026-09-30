@@ -69,9 +69,11 @@ on the network (`sudo systemctl edit ollama` → `Environment="OLLAMA_HOST=0.0.0
 on Tailscale only (e.g. `sudo ufw allow in on tailscale0 to any port 11434 proto tcp`), then use
 **Custom** with `http://<pc>.<tailnet>.ts.net:11434/v1` and the model's name. For self-hosted models
 the app has the server enforce the reply format, so even 1B models keep to it — but they pick the
-wrong action more often than big ones; 3B+ is noticeably better. Her prompts run to about 2,600 tokens, so check that
-`ollama ps` shows a CONTEXT of 4096 or more (older Ollama versions default to 2048; set
-`OLLAMA_CONTEXT_LENGTH=4096` or higher on the server). To judge a model with Naomi's real
+wrong action more often than big ones; 3B+ is noticeably better. Her prompt alone runs to about
+2,400 tokens, and with the 20 exchanges she keeps of a conversation to about 4,400, so give Ollama
+an 8K context: `Environment="OLLAMA_CONTEXT_LENGTH=8192"` in the same drop-in, then check that
+`ollama ps` shows a CONTEXT of 8192 (Ollama's default is 4096; for a 3B model the extra 4K costs
+about 0.45 GB of VRAM). To judge a model with Naomi's real
 prompt: `NAOMI_LLM_URL=http://127.0.0.1:11434/v1 NAOMI_LLM_MODEL=<name> ./gradlew :app:testDebugUnitTest --tests '*LiveBrainTest*' -i`.
 
 **Web search (live questions):** scores, prices, opening hours, news. She searches your own
