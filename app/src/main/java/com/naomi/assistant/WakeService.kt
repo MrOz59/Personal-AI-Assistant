@@ -558,6 +558,15 @@ class WakeService : Service() {
 
     /** Bring MainActivity to the front (works locked/closed) via a full-screen intent. */
     private fun bringUpAppForCommand() {
+        // On an unlocked phone with another app open, Naomi floats over it instead of taking the
+        // screen: the same conversation, in a small orb (see FloatingOrb).
+        if (!MainActivity.inFront && FloatingOrb.canShow(this)) {
+            main.post {
+                FloatingOrb.show(this)
+                Conversation.get(this).wake()
+            }
+            return
+        }
         // If the display is off, light it up first — otherwise the user can't see the UI.
         val pm = getSystemService(PowerManager::class.java)
         if (!pm.isInteractive) {

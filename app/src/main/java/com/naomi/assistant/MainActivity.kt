@@ -72,6 +72,7 @@ import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.outlined.Accessibility
 import androidx.compose.material.icons.outlined.Add
 import androidx.compose.material.icons.outlined.AutoAwesome
+import androidx.compose.material.icons.outlined.PictureInPictureAlt
 import androidx.compose.material.icons.outlined.BatteryChargingFull
 import androidx.compose.material.icons.outlined.Bookmark
 import androidx.compose.material.icons.outlined.Check
@@ -153,16 +154,6 @@ private const val VOICE_THRESHOLD_MAX = 0.80f
 // Voice training: "Naomi"s collected per profile, and how long to wait for them.
 private const val ENROLL_CLIPS = 8
 private const val ENROLL_TIMEOUT_MS = 90_000L
-// Someone else's speech ignored this many times in a row ends the conversation.
-private const val MAX_IGNORED_IN_A_ROW = 2
-// Longest wait for the wake listener to let go of the mic before the recognizer starts.
-private const val MIC_HANDOVER_MS = 800L
-// A wake arriving this soon after the last one is its duplicate.
-private const val WAKE_REPEAT_MS = 2_000L
-// A noisy or short sentence scoring within this much below the voice-match threshold isn't taken
-// for someone else: noise pulls the owner's own score down that far.
-private const val UNSURE_MARGIN = 0.20f
-private const val PREF_LAST_SPEAKER_SIM = "last_speaker_similarity"
 
 /**
  * Naomi — voice assistant UI.
@@ -177,29 +168,37 @@ private const val PREF_LAST_SPEAKER_SIM = "last_speaker_similarity"
  *   SETTINGS — voice options + one-tap links to the OS permissions Naomi needs.
  *   BRAIN    — which AI thinks for Naomi in smart mode, its API key, and her personality.
  */
-class MainActivity : ComponentActivity() {
+class MainActivity : ComponentActivity(), Conversation.Host {
 
-    /** What Naomi is doing right now — drives the animated orb. */
-    enum class Mood { IDLE, LISTENING, THINKING, SPEAKING }
+    companion object {
+        /** Whether the app is on screen — then a "Naomi" goes to it, not to the floating orb. */
+        @Volatile var inFront = false
+            private set
+    }
 
     /** The visible page. Everything but HOME has a back arrow. */
     enum class Screen { HOME, FACTS, ADD_FACT, SETTINGS, BRAIN }
 
+    // The conversation, shared with the floating orb: its recognizer, voice and brain, and what
+    // it shows — the orb's mood, the status line, the last exchange.
+    private lateinit var session: Conversation
     private lateinit var voice: VoiceInput
     private lateinit var speaker: Speaker
     private lateinit var brain: AssistantBrain
 
-    private var status by mutableStateOf("Tap the orb or say \"Naomi\"")
-    private var transcript by mutableStateOf("")
+    private var status: String
+        get() = session.status
+        set(value) { session.status = value }
+    private var transcript: String
+        get() = session.transcript
+        set(value) { session.transcript = value }
+    private val mood: Mood get() = session.mood
     private var wakeEnabled by mutableStateOf(false)
     private var showSplash by mutableStateOf(false) // set in onCreate based on launch type
     private var voiceTrained by mutableStateOf(false)
-    private var mood by mutableStateOf(Mood.IDLE)
     private var smartMode by mutableStateOf(false)
+    private var floating by mutableStateOf(true)
     private var factMode by mutableStateOf(false)
-    private var turnJob: Job? = null // the in-flight assistant turn, so we can cancel on reset
-    private var listenStarting: Job? = null // a listen on its way (waiting for the mic), so it isn't started twice
-    private var lastWakeAt = 0L // when the last wake was acted on, to drop its duplicate
 
     // Power button (screen off) mid-interaction → stop everything and reset to idle.
     private val screenOffReceiver = object : BroadcastReceiver() {
@@ -222,12 +221,8 @@ class MainActivity : ComponentActivity() {
     private var lastSim by mutableStateOf(-1f)
     private var lastSimAt by mutableStateOf(0L)
     // The last per-sentence voice check, and whether the speech service lets us make it at all.
-    private var lastSpeakerSim by mutableStateOf(-1f)
+    private val lastSpeakerSim: Float get() = session.lastSpeakerSim
     private var speakerCheck by mutableStateOf<Boolean?>(null)
-    private var ignoredInARow = 0
-    // The next sentence opens a turn the owner just started — by a verified "Naomi", or a tap on
-    // an unlocked phone — so it's theirs, however noise scores it.
-    private var trustNextSentence = false
     // What the voice pipeline did lately (see VoiceLog), for the Settings screen.
     private var voiceLog by mutableStateOf<List<String>>(emptyList())
     private val voiceLogChanged: () -> Unit = { runOnUiThread { voiceLog = VoiceLog.recent(this) } }
@@ -240,9 +235,6 @@ class MainActivity : ComponentActivity() {
 
     /** Blocks orb taps while Naomi is speaking the post-recording confirmation. */
     @Volatile private var recordingCooldown = false
-
-    /** Guards a follow-up so only the first answer (barge-in OR after-question) is processed. */
-    private val answerConsumed = java.util.concurrent.atomic.AtomicBoolean(true)
 
     private val neededPermissions = arrayOf(
         Manifest.permission.RECORD_AUDIO,
@@ -274,15 +266,16 @@ class MainActivity : ComponentActivity() {
             refreshSetup()
         }
 
+    private fun enterMood(m: Mood) = session.enterMood(m)
+
     /** Keep the screen awake while a conversation turn is in progress. */
-    private fun enterMood(m: Mood) {
-        mood = m
-        if (m == Mood.IDLE) {
-            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        } else {
-            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        }
+    override fun keepScreenOn(on: Boolean) {
+        if (on) window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        else window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
     }
+
+    /** Reveals the app that was open behind Naomi, so its screen can be driven. */
+    override fun stepAside(): Boolean = moveTaskToBack(true)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -294,18 +287,14 @@ class MainActivity : ComponentActivity() {
             setTurnScreenOn(true)
         }
 
-        voice = VoiceInput(this)
-        // When the user starts talking (e.g. answering a follow-up), cut Naomi off immediately.
-        voice.onSpeechStart = { speaker.stop() }
-        speaker = Speaker(this)
-
-        // A bare follow-up answer heard over Naomi's question (via the AEC wake mic).
-        WakeService.answerCallback = { word -> onSpokenAnswer(word) }
-        WakeService.deniedCallback = { onVoiceDenied() }
-        // Which cloud brain to use, its API key and Naomi's personality are set in-app (BRAIN).
-        brain = AssistantBrain(this)
-        // "Let me check." while she looks something up, so the wait isn't silent.
-        brain.onAside = { line -> speaker.aside(line) }
+        // The recognizer, her voice and the brain (set up in-app, on BRAIN) belong to the
+        // conversation, which the floating orb carries on too.
+        session = Conversation.get(this)
+        session.host = this
+        voice = session.voice
+        speaker = session.speaker
+        brain = session.brain
+        if (session.mood == Mood.IDLE && session.transcript.isEmpty()) status = session.idleStatus()
         facts = brain.memory.all()
         memories = brain.memories.all()
         learning = brain.settings.learnMemories
@@ -325,6 +314,7 @@ class MainActivity : ComponentActivity() {
         if (missing.isNotEmpty()) permissionLauncher.launch(missing.toTypedArray())
 
         voiceTrained = enrollment.isEnrolled
+        floating = FloatingOrb.enabled(this)
 
         // Show the splash only when the user taps the launcher icon, not on voice wake or when
         // launched as the assistant.
@@ -406,6 +396,8 @@ class MainActivity : ComponentActivity() {
                         onNavigate    = { screen = it },
                         onOrbTap      = { onMicTapped() },
                         onWakeToggle  = { toggleWake() },
+                        floating      = floating,
+                        onFloatingToggle = { toggleFloating() },
                         onSmartToggle = { onSmartToggle(it) },
                         onTrain       = { trainVoice() },
                         onForgetVoice = { forgetVoice() },
@@ -437,6 +429,10 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        // The app shows Naomi now: a conversation the floating orb was holding carries on here.
+        inFront = true
+        session.host = this
+        FloatingOrb.hide()
         // Coming back from a system settings screen — refresh the setup checklist + facts.
         refreshSetup()
         // On Automatic, the phone's language may have changed meanwhile.
@@ -452,9 +448,13 @@ class MainActivity : ComponentActivity() {
             lastSim = prefs.getFloat("last_similarity", -1f)
             lastSimAt = prefs.getLong("last_similarity_at", 0L)
         }
-        lastSpeakerSim = getSharedPreferences("naomi", MODE_PRIVATE).getFloat(PREF_LAST_SPEAKER_SIM, -1f)
         speakerCheck = voice.speakerCheckSupported
         voiceLog = VoiceLog.recent(this)
+    }
+
+    override fun onPause() {
+        inFront = false
+        super.onPause()
     }
 
     /** Persist and apply a new voice-match threshold from the Settings slider. */
@@ -503,11 +503,23 @@ class MainActivity : ComponentActivity() {
             }
             return
         }
+        // `--es naomi_float "what's the weather"`: the floating orb over the home screen, on a turn
+        // from typed words (or, empty, listening) — as a "Naomi" over another app would.
+        intent?.getStringExtra("naomi_float")?.let { typed ->
+            intent.removeExtra("naomi_float")
+            moveTaskToBack(true)
+            // After this activity's resume, which takes the orb down, has come and gone.
+            Handler(Looper.getMainLooper()).postDelayed({
+                FloatingOrb.show(this)
+                if (typed.isBlank()) session.wake() else session.runTurn(typed, Who.OWNER)
+            }, 800)
+            return
+        }
         // `--es naomi_turn "where's the closest bus stop"`: a whole turn from typed words, as the owner.
         intent?.getStringExtra("naomi_turn")?.let { typed ->
             intent.removeExtra("naomi_turn")
             if (wakeEnabled) WakeService.pause(this)
-            runTurn(typed, Who.OWNER)
+            session.runTurn(typed, Who.OWNER)
             return
         }
         val text = intent?.getStringExtra("naomi_stt_test") ?: return
@@ -557,20 +569,11 @@ class MainActivity : ComponentActivity() {
     private fun handleWakeIntent(intent: Intent?) {
         if (intent?.getBooleanExtra(WakeService.EXTRA_WAKE, false) != true) return
         intent.removeExtra(WakeService.EXTRA_WAKE)
-        // Each wake reaches us twice — a direct start and its full-screen notification, a moment
-        // apart. A second listen would cancel and restart the recognizer, which then hears nothing.
-        val now = android.os.SystemClock.elapsedRealtime()
-        if (now - lastWakeAt < WAKE_REPEAT_MS) return
-        lastWakeAt = now
-        screen = Screen.HOME // voice wake always lands on the orb
-        speaker.stop() // barge-in: cut off whatever Naomi was saying
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
-            == PackageManager.PERMISSION_GRANTED
-        ) {
-            // The wake service only brings us up for the owner's voice (or anyone's, untrained).
-            trustNextSentence = true
-            startListening()
-        }
+            != PackageManager.PERMISSION_GRANTED
+        ) return
+        // Barge-in and listen; a wake's duplicate (it can come twice) is dropped.
+        if (session.wake()) screen = Screen.HOME // voice wake always lands on the orb
     }
 
     // ── Facts ──────────────────────────────────────────────────────────────────
@@ -698,6 +701,18 @@ class MainActivity : ComponentActivity() {
                 Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             )
         } catch (_: Exception) {}
+    }
+
+    /** Floating over other apps on "Naomi", or opening the app; turning it on may need the permission first. */
+    private fun toggleFloating() {
+        if (!Settings.canDrawOverlays(this)) {
+            FloatingOrb.setEnabled(this, true)
+            floating = true
+            openSetup(Setup.OVERLAY)
+            return
+        }
+        floating = !floating
+        FloatingOrb.setEnabled(this, floating)
     }
 
     private fun toggleWake() {
@@ -933,20 +948,14 @@ class MainActivity : ComponentActivity() {
         refreshBrainUi("✓ Personality saved")
     }
 
-    private fun isTurnOnLocation(lower: String): Boolean =
-        Regex("\\b(location|gps)\\b").containsMatchIn(lower) &&
-            Regex("\\b(on|enable|turn|start)\\b").containsMatchIn(lower)
-
-    private fun needsLocation(lower: String): Boolean =
-        Regex("\\b(uber|ola|rapido|cab|ride|taxi|swiggy|zomato|navigate|directions|near me)\\b")
-            .containsMatchIn(lower) || lower.contains("take me to") || lower.contains("order food")
-
     /**
      * Ensures location is on, then runs [onReady]. If it's already on, [onReady] runs
      * immediately; if off, the one-tap system dialog shows and [onReady] runs once it closes —
      * so the caller can open the target app (Uber/Maps) AFTER the user enables location.
      */
-    private fun ensureLocationOn(onReady: () -> Unit = {}) {
+    override fun ensureLocationOn(then: () -> Unit) = ensureLocation(then)
+
+    private fun ensureLocation(onReady: () -> Unit = {}) {
         val request = LocationSettingsRequest.Builder()
             .addLocationRequest(
                 LocationRequest.Builder(Priority.PRIORITY_BALANCED_POWER_ACCURACY, 10_000L).build()
@@ -967,56 +976,6 @@ class MainActivity : ComponentActivity() {
                     onReady() // can't resolve here → just proceed
                 }
             }
-    }
-
-    /** A screen-control command: tap a labelled element, scroll, or type into a field. */
-    private data class ScreenCmd(val action: String, val target: String)
-
-    /** Recognizes "place order / tap X / select X / scroll down / type X" style commands. */
-    private fun parseScreenControl(lower: String): ScreenCmd? = when {
-        Regex("\\bscroll\\b").containsMatchIn(lower) ->
-            ScreenCmd("scroll", if (lower.contains("up")) "up" else "down")
-        Regex("\\b(place (the )?order|place it|check ?out|confirm (the )?order|proceed)\\b").containsMatchIn(lower) ->
-            ScreenCmd("tap", "place order|checkout|check out|proceed|confirm|place")
-        Regex("\\b(tap|click|press|select|choose)\\b").containsMatchIn(lower) -> {
-            val t = firstAfterVerb(lower, "tap", "click", "press", "select", "choose")
-            if (t.isBlank()) null else ScreenCmd("tap", t)
-        }
-        lower.startsWith("type ") -> ScreenCmd("type", lower.removePrefix("type ").trim())
-        else -> null
-    }
-
-    private fun firstAfterVerb(text: String, vararg verbs: String): String {
-        for (v in verbs) {
-            val m = Regex("\\b$v\\b\\s+(?:on |the )?(.+)").find(text)
-            if (m != null) return m.groupValues[1]
-                .replace(Regex("\\b(button|option|please|now)\\b"), "").trim()
-        }
-        return ""
-    }
-
-    /** Sends Naomi to the background to reveal the target app, then performs the screen action. */
-    private fun performScreenControl(sc: ScreenCmd) {
-        if (!WhatsAppSender.isEnabled) {
-            enterMood(Mood.SPEAKING)
-            status = "Enable Naomi in Accessibility to control apps."
-            speaker.speak("To control apps, please enable Naomi in your accessibility settings.") {
-                enterMood(Mood.IDLE)
-            }
-            try {
-                startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-            } catch (_: Exception) {}
-            if (wakeEnabled) WakeService.resume(this)
-            return
-        }
-        enterMood(Mood.IDLE)
-        status = "On it…"
-        if (wakeEnabled) WakeService.resume(this)
-        // Reveal the app that was open behind Naomi, then act on it once it's settled.
-        moveTaskToBack(true)
-        Handler(Looper.getMainLooper()).postDelayed({
-            WhatsAppSender.perform(sc.action, sc.target)
-        }, 750)
     }
 
     private fun onMicTapped() {
@@ -1043,19 +1002,12 @@ class MainActivity : ComponentActivity() {
                 })
             return
         }
-        speaker.stop() // tapping also interrupts any ongoing speech
-        // Whoever unlocked the phone and tapped is taken to be the owner for this first sentence.
-        trustNextSentence = true
-        startListening()
+        // Interrupts any speech; whoever unlocked the phone and tapped is taken to be the owner.
+        session.tapped()
     }
 
     private fun isDeviceLocked(): Boolean =
         getSystemService(KeyguardManager::class.java)?.isKeyguardLocked == true
-
-    /** WakeService refused a stranger's "Naomi" (and said so out loud). */
-    private fun onVoiceDenied() {
-        if (mood == Mood.IDLE) status = "Voice not recognized — access denied"
-    }
 
     private fun stopRecordingNow() {
         val msg = VoiceRecorder.stop()
@@ -1070,214 +1022,8 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun startListening() {
-        // Already on its way — waiting for the mic.
-        if (listenStarting?.isActive == true) return
-        if (wakeEnabled) WakeService.pause(this) // free the mic from Vosk for this turn
-        enterMood(Mood.LISTENING)
-        status = "Listening…"
-        // Get a local brain loading while the user speaks, not after.
-        lifecycleScope.launch(Dispatchers.IO) { brain.warmUp() }
-        // The recognizer needs the mic to itself — Android silences it while the wake listener
-        // still records — so wait (briefly) for the pause to land.
-        listenStarting = lifecycleScope.launch {
-            val deadline = android.os.SystemClock.elapsedRealtime() + MIC_HANDOVER_MS
-            while (WakeService.micActive && android.os.SystemClock.elapsedRealtime() < deadline) delay(20)
-            // Names she knows, for the recognizer to listen out for (contacts are read off the main thread).
-            voice.vocabulary = withContext(Dispatchers.IO) { brain.vocabulary() }
-            if (mood == Mood.LISTENING) listenNow()
-        }
-    }
-
-    private fun listenNow() {
-        voice.listen(
-            onResult = { heard ->
-                val spoken = heard.text
-                android.util.Log.d("Naomi", "Heard: \"$spoken\"" +
-                    if (heard.alternatives.isEmpty()) "" else " (or: ${heard.alternatives.joinToString(" | ")})")
-                enterMood(Mood.THINKING)
-                val trusted = trustNextSentence
-                trustNextSentence = false
-                lifecycleScope.launch { onHeard(spoken, identifySpeaker(spoken, heard.audio, trusted), heard.alternatives) }
-            },
-            onError = { message ->
-                android.util.Log.e("Naomi", "STT error: $message")
-                VoiceLog.add(this, "Speech recognizer: $message")
-                trustNextSentence = false
-                enterMood(Mood.IDLE)
-                if (brain.hasPending) {
-                    // Silence after Naomi spoke just ends the conversation — nothing to report,
-                    // and no stale question left to hijack the next command.
-                    brain.endFollowUp()
-                    status = if (wakeEnabled) "Say \"Naomi\" anytime…" else "Tap the orb or say \"Naomi\""
-                } else {
-                    status = message
-                }
-                if (wakeEnabled) WakeService.resume(this@MainActivity)
-            }
-        )
-    }
-
-    /**
-     * Speaks a reply that expects an answer, then listens for it:
-     *  - For a one-word choice ("WhatsApp or text?"), the AEC wake mic listens DURING the question
-     *    for a bare answer ("yes/cancel/whatsapp…"), so the user can talk over Naomi.
-     *  - In free conversation that grammar would cut sentences short, so only the (voice-verified)
-     *    wake word can interrupt her mid-reply.
-     *  - If they stay silent, the normal recognizer opens the moment she finishes.
-     * Whichever fires first wins (guarded by [answerConsumed]).
-     */
-    private fun askFollowUp(text: String) {
-        answerConsumed.set(false)
-        enterMood(Mood.SPEAKING)
-        status = "Listening after I speak…"
-        if (brain.awaitingChoice) {
-            // AEC answer mode catches barge-in ("yes/whatsapp/cancel") WHILE Naomi is speaking.
-            WakeService.listenForAnswer(this)
-        } else if (wakeEnabled) {
-            WakeService.resume(this)
-        }
-        speaker.speak(text) {
-            // ALWAYS open the full recognizer after the question — even if AEC fired on noise.
-            // If the pending follow-up was already handled via barge-in, brain.hasPending is false
-            // and startListening() won't try to process a stale answer.
-            WakeService.pause(this)
-            lifecycleScope.launch {
-                delay(80)
-                if (brain.hasPending) startListening()
-            }
-        }
-    }
-
-    /**
-     * Whose voice an utterance was, against the owner's voiceprint. UNKNOWN when there's no print
-     * yet, or the speech service didn't let us hear the audio (then everyone is taken as before).
-     * A [trusted] sentence — the first of a turn the owner just opened — is theirs. Otherwise a
-     * noisy or short sentence that scores a little under the threshold is UNKNOWN, not someone
-     * else: noise pulls the owner's score down, and ignoring them in a street is worse than
-     * answering a passer-by.
-     */
-    private suspend fun identifySpeaker(spoken: String, audio: ShortArray?, trusted: Boolean): Who {
-        if (!enrollment.isEnrolled) return Who.UNKNOWN
-        val said = "\"${spoken.take(40)}${if (spoken.length > 40) "…" else ""}\""
-        if (audio == null) {
-            if (voice.speakerCheckSupported == true) VoiceLog.add(this, "$said: no audio for a voice check")
-            return if (trusted) Who.OWNER else Who.UNKNOWN
-        }
-        val check = withContext(Dispatchers.Default) { enrollment.speakerCheck(audio) }
-        if (check == null) {
-            VoiceLog.add(this, "$said: too little voice to check, taken as you")
-            return if (trusted) Who.OWNER else Who.UNKNOWN
-        }
-        val sim = check.similarity
-        val threshold = WakeService.similarityThreshold
-        val who = when {
-            trusted || sim >= threshold -> Who.OWNER
-            (check.noisy || check.short) && sim >= threshold - UNSURE_MARGIN -> Who.UNKNOWN
-            else -> Who.GUEST
-        }
-        val conditions = listOfNotNull(
-            check.snrDb?.let { "voice ${it.toInt()} dB over the background" },
-            "${"%.1f".format(check.voicedSeconds)} s of voice",
-        ).joinToString(", ")
-        VoiceLog.add(this, "$said: voice ${"%.2f".format(sim)} ($conditions) → " + when (who) {
-            Who.OWNER -> if (sim >= threshold) "you" else "you (turn just opened)"
-            Who.UNKNOWN -> "probably you, too noisy to be sure"
-            Who.GUEST -> "someone else"
-        })
-        android.util.Log.d("Naomi", "speaker similarity=${"%.3f".format(sim)} → $who")
-        VoiceDebug.keep(this, "sentence", audio, org.json.JSONObject().put("text", spoken).put("similarity", sim.toDouble())
-            .put("snr_db", check.snrDb ?: org.json.JSONObject.NULL).put("voiced_s", check.voicedSeconds)
-            .put("trusted", trusted).put("who", who.name).put("threshold", threshold.toDouble()))
-        lastSpeakerSim = sim
-        getSharedPreferences("naomi", MODE_PRIVATE).edit().putFloat(PREF_LAST_SPEAKER_SIM, sim).apply()
-        return who
-    }
-
-    /**
-     * Acts on something heard. Someone other than the owner who isn't talking to Naomi — people
-     * talking to the owner while they talk to her — is ignored, and she keeps listening for the
-     * owner. A guest who addresses her by name ("Naomi, …") is answered, as a guest.
-     */
-    private fun onHeard(spoken: String, who: Who, heardAs: List<String> = emptyList()) {
-        if (who == Who.GUEST && !Regex("\\bnaomi\\b", RegexOption.IGNORE_CASE).containsMatchIn(spoken)) {
-            android.util.Log.d("Naomi", "Ignored someone else: \"$spoken\"")
-            VoiceLog.add(this, "Ignored: someone else, not talking to me")
-            if (++ignoredInARow <= MAX_IGNORED_IN_A_ROW) {
-                status = "Listening for ${brain.memory.get("name") ?: "you"}…"
-                startListening()
-            } else {
-                ignoredInARow = 0
-                brain.endFollowUp()
-                enterMood(Mood.IDLE)
-                status = if (wakeEnabled) "Say \"Naomi\" anytime…" else "Tap the orb or say \"Naomi\""
-                if (wakeEnabled) WakeService.resume(this)
-            }
-            return
-        }
-        ignoredInARow = 0
-        transcript = "${if (who == Who.GUEST) "Guest" else "You"}: $spoken"
-        val lower = spoken.lowercase()
-        if (isTurnOnLocation(lower)) {
-            // Pure "turn on location" — no app to redirect to, just enable it.
-            ensureLocationOn()
-            enterMood(Mood.SPEAKING)
-            status = "Turning on location…"
-            speaker.speak("Turning on location.") { enterMood(Mood.IDLE) }
-            if (wakeEnabled) WakeService.resume(this)
-            return
-        }
-        route(spoken, lower, who, heardAs)
-    }
-
-    /** A follow-up answer was spoken over the question (caught by the AEC wake mic). */
-    private fun onSpokenAnswer(word: String) {
-        if (!answerConsumed.compareAndSet(false, true)) return
-        speaker.stop()
-        WakeService.pause(this)
-        runTurn(word)
-    }
-
-    /** Routes a recognized command to screen-control, location-gated, or a normal turn. */
-    private fun route(spoken: String, lower: String, who: Who, heardAs: List<String> = emptyList()) {
-        // Driving other apps' screens is the owner's alone; a guest's words go to the brain.
-        val screenCmd = if (who == Who.GUEST) null else parseScreenControl(lower)
-        if (screenCmd != null) {
-            performScreenControl(screenCmd)
-            return
-        }
-        if (needsLocation(lower)) ensureLocationOn { runTurn(spoken, who, heardAs) } else runTurn(spoken, who, heardAs)
-    }
-
-    /** Runs one assistant turn: think → act/answer → speak, re-arming wake afterward. */
-    private fun runTurn(spoken: String, who: Who = Who.UNKNOWN, heardAs: List<String> = emptyList()) {
-        enterMood(Mood.THINKING)
-        status = "Thinking…"
-        turnJob = lifecycleScope.launch {
-            val reply = brain.handle(spoken, who, heardAs)
-            android.util.Log.d("Naomi", "Reply: \"${reply.text}\" (listenAgain=${reply.listenAgain})")
-            transcript = "${if (who == Who.GUEST) "Guest" else "You"}: $spoken\n\nNaomi: ${reply.text}"
-            if (reply.listenAgain) {
-                askFollowUp(reply.text)
-            } else {
-                enterMood(Mood.SPEAKING)
-                // Keep wake paused if recording is active — mic belongs to MediaRecorder.
-                val resumeWake = wakeEnabled && !VoiceRecorder.isRecording
-                status = when {
-                    VoiceRecorder.isRecording -> "Recording… tap the orb to stop"
-                    wakeEnabled -> "Say \"Naomi\" anytime…"
-                    else -> "Tap the orb or say \"Naomi\""
-                }
-                speaker.speak(reply.text) { enterMood(Mood.IDLE) }
-                if (resumeWake) WakeService.resume(this@MainActivity)
-            }
-        }
-    }
-
     /** True when Naomi is actively doing something the user might want to abort. */
-    private fun isInteracting(): Boolean =
-        factMode || enrollClips != null || brain.hasPending ||
-        mood == Mood.LISTENING || mood == Mood.THINKING || mood == Mood.SPEAKING
+    private fun isInteracting(): Boolean = factMode || enrollClips != null || session.busy
 
     /**
      * Hard stop: abort whatever Naomi is doing (speaking, listening, thinking, a pending
@@ -1286,23 +1032,9 @@ class MainActivity : ComponentActivity() {
      */
     private fun resetToInitial() {
         if (enrollClips != null) stopEnrollment()
-        turnJob?.cancel(); turnJob = null
-        speaker.stop()
-        voice.cancel()
-        answerConsumed.set(true)
         factMode = false
-        brain.cancel()
-        enterMood(Mood.IDLE)
-        transcript = ""
+        session.reset()
         screen = Screen.HOME
-        if (wakeEnabled && !VoiceRecorder.isRecording) {
-            WakeService.resume(this)            // back to passive "Naomi" listening
-            status = "Say \"Naomi\" anytime…"
-        } else {
-            WakeService.pause(this)
-            status = if (VoiceRecorder.isRecording) "Recording… tap the orb to stop"
-                     else "Tap the orb or say \"Naomi\""
-        }
     }
 
     /**
@@ -1445,44 +1177,15 @@ class MainActivity : ComponentActivity() {
         if (brain.memories.onChange === memoriesChanged) brain.memories.onChange = null
         if (VoiceLog.onChange === voiceLogChanged) VoiceLog.onChange = null
         if (PortugueseModel.onChange === answersModelChanged) PortugueseModel.onChange = null
-        // The conversation in progress still gets noted down.
-        brain.cancel()
-        voice.destroy()
-        speaker.shutdown()
+        // The recognizer and her voice are the conversation's, which the floating orb may still be
+        // using. Closing the app ends a conversation it was showing (and notes it down).
+        if (session.host === this) {
+            session.host = null
+            if (isFinishing) session.reset()
+        }
         super.onDestroy()
     }
 }
-
-// ── Design Tokens ────────────────────────────────────────────────────────────
-private val BgColor          = Color(0xFF0F131F)
-private val PrimaryViolet    = Color(0xFFC6BFFF)
-private val CyanAccent       = Color(0xFF00D9FF)
-private val MagentaAccent    = Color(0xFFDE4DFF)
-private val RecordingRed     = Color(0xFFFF4444)
-private val SuccessGreen     = Color(0xFF3DD68C)
-private val SurfaceHigh      = Color(0xFF262A37)
-private val OnSurface        = Color(0xFFDFE2F3)
-private val OnSurfaceVariant = Color(0xFFC8C4D7)
-private val OutlineColor     = Color(0xFF928EA0)
-
-private val GlassFill   = Color.White.copy(alpha = 0.08f)
-private val GlassBorder = Color.White.copy(alpha = 0.12f)
-
-// ── Fonts ─────────────────────────────────────────────────────────────────────
-private val fontProvider = GoogleFont.Provider(
-    providerAuthority = "com.google.android.gms.fonts",
-    providerPackage   = "com.google.android.gms",
-    certificates      = R.array.com_google_android_gms_fonts_certs
-)
-private val SpaceGrotesk = FontFamily(
-    Font(GoogleFont("Space Grotesk"), fontProvider, FontWeight.Medium),
-    Font(GoogleFont("Space Grotesk"), fontProvider, FontWeight.SemiBold),
-    Font(GoogleFont("Space Grotesk"), fontProvider, FontWeight.Bold),
-)
-private val InterFamily = FontFamily(
-    Font(GoogleFont("Inter"), fontProvider, FontWeight.Normal),
-    Font(GoogleFont("Inter"), fontProvider, FontWeight.Medium),
-)
 
 // ── Theme wrapper ─────────────────────────────────────────────────────────────
 @Composable
@@ -1494,7 +1197,7 @@ private fun NaomiTheme(content: @Composable () -> Unit) {
 @Composable
 private fun NaomiApp(
     screen: MainActivity.Screen,
-    mood: MainActivity.Mood,
+    mood: Mood,
     status: String,
     transcript: String,
     wakeEnabled: Boolean,
@@ -1519,6 +1222,8 @@ private fun NaomiApp(
     onNavigate: (MainActivity.Screen) -> Unit,
     onOrbTap: () -> Unit,
     onWakeToggle: () -> Unit,
+    floating: Boolean,
+    onFloatingToggle: () -> Unit,
     onSmartToggle: (Boolean) -> Unit,
     onTrain: () -> Unit,
     onForgetVoice: () -> Unit,
@@ -1592,6 +1297,8 @@ private fun NaomiApp(
                     onThresholdChange = onThresholdChange,
                     onBack = { onNavigate(MainActivity.Screen.HOME) },
                     onWakeToggle = onWakeToggle,
+                    floating = floating,
+                    onFloatingToggle = onFloatingToggle,
                     onSmartToggle = onSmartToggle,
                     onTrain = onTrain,
                     onForgetVoice = onForgetVoice,
@@ -1644,7 +1351,7 @@ private fun AmbientBackground() {
 // ── HOME ────────────────────────────────────────────────────────────────────
 @Composable
 private fun HomeScreen(
-    mood: MainActivity.Mood,
+    mood: Mood,
     status: String,
     transcript: String,
     factCount: Int,
@@ -1704,9 +1411,9 @@ private fun HomeScreen(
                     letterSpacing = 1.5.sp,
                     color = when {
                         isRecording                          -> RecordingRed
-                        mood == MainActivity.Mood.LISTENING -> CyanAccent
-                        mood == MainActivity.Mood.THINKING  -> PrimaryViolet
-                        mood == MainActivity.Mood.SPEAKING  -> MagentaAccent
+                        mood == Mood.LISTENING -> CyanAccent
+                        mood == Mood.THINKING  -> PrimaryViolet
+                        mood == Mood.SPEAKING  -> MagentaAccent
                         else                                -> OnSurfaceVariant.copy(alpha = 0.7f)
                     },
                     textAlign = TextAlign.Center,
@@ -2069,6 +1776,8 @@ private fun SettingsScreen(
     onThresholdChange: (Float) -> Unit,
     onBack: () -> Unit,
     onWakeToggle: () -> Unit,
+    floating: Boolean,
+    onFloatingToggle: () -> Unit,
     onSmartToggle: (Boolean) -> Unit,
     onTrain: () -> Unit,
     onForgetVoice: () -> Unit,
@@ -2119,6 +1828,18 @@ private fun SettingsScreen(
                 accent = CyanAccent,
                 checked = wakeEnabled,
                 onToggle = { onWakeToggle() }
+            )
+            SettingToggleRow(
+                title = "Float over other apps",
+                subtitle = when {
+                    !setup.overlay -> "Needs \"Display over other apps\" — tap to allow"
+                    floating -> "\"Naomi\" over another app answers there, in a small orb"
+                    else -> "\"Naomi\" always opens the app"
+                },
+                icon = Icons.Outlined.PictureInPictureAlt,
+                accent = CyanAccent,
+                checked = floating && setup.overlay,
+                onToggle = { onFloatingToggle() }
             )
             SettingToggleRow(
                 title = "Smart Mode",
@@ -3087,199 +2808,6 @@ private fun NaomiSplash(onComplete: () -> Unit) {
                     cap = StrokeCap.Round
                 )
             }
-        }
-    }
-}
-
-// ── Orbit stars ───────────────────────────────────────────────────────────────
-private val DEG_TO_RAD = (Math.PI / 180.0).toFloat()
-
-private data class OrbitStar(
-    val rMult: Float, val a0Deg: Float, val yScale: Float,
-    val dotR: Float, val alpha: Float,
-    val tint: Color = Color.White, val reversed: Boolean = false
-)
-
-private val ORBIT_STARS = listOf(
-    // inner ring (clockwise)
-    OrbitStar(1.32f,   0f, 0.40f, 2.5f, 0.85f, Color(0xFF00D9FF)),
-    OrbitStar(1.40f,  45f, 0.60f, 1.8f, 0.60f),
-    OrbitStar(1.35f,  90f, 0.35f, 3.0f, 0.80f, Color(0xFFC6BFFF)),
-    OrbitStar(1.44f, 135f, 0.55f, 2.0f, 0.55f),
-    OrbitStar(1.38f, 180f, 0.45f, 2.5f, 0.90f, Color(0xFF00D9FF)),
-    OrbitStar(1.42f, 225f, 0.50f, 1.5f, 0.60f, Color(0xFFC6BFFF)),
-    OrbitStar(1.30f, 270f, 0.65f, 3.0f, 0.85f),
-    OrbitStar(1.46f, 315f, 0.30f, 2.0f, 0.65f),
-    // outer ring (counter-clockwise)
-    OrbitStar(1.55f,  22f, 0.50f, 1.8f, 0.35f, Color(0xFF00D9FF), reversed = true),
-    OrbitStar(1.60f, 112f, 0.40f, 2.0f, 0.30f, reversed = true),
-    OrbitStar(1.52f, 202f, 0.55f, 1.5f, 0.35f, Color(0xFFC6BFFF), reversed = true),
-    OrbitStar(1.58f, 292f, 0.45f, 1.8f, 0.28f, reversed = true),
-)
-
-// ── Voice Orb ─────────────────────────────────────────────────────────────────
-@Composable
-private fun NaomiOrb(
-    mood: MainActivity.Mood,
-    isRecording: Boolean,
-    onTap: () -> Unit
-) {
-    val orbColor by animateColorAsState(
-        targetValue = when {
-            isRecording                          -> RecordingRed
-            mood == MainActivity.Mood.LISTENING -> CyanAccent
-            mood == MainActivity.Mood.THINKING  -> PrimaryViolet
-            mood == MainActivity.Mood.SPEAKING  -> MagentaAccent
-            else                                -> PrimaryViolet
-        },
-        animationSpec = tween(400),
-        label = "orbColor"
-    )
-
-    val inf = rememberInfiniteTransition(label = "orb")
-
-    // Idle / speaking / recording: gentle breathe
-    val breathe by inf.animateFloat(
-        initialValue = 0.95f, targetValue = 1.05f,
-        animationSpec = infiniteRepeatable(tween(2000, easing = EaseInOut), RepeatMode.Reverse),
-        label = "breathe"
-    )
-
-    // Listening: three ring expansion values (staggered)
-    val ring1 by inf.animateFloat(
-        initialValue = 1f, targetValue = 2.4f,
-        animationSpec = infiniteRepeatable(tween(1800, easing = LinearEasing), RepeatMode.Restart),
-        label = "ring1"
-    )
-    val ring2 by inf.animateFloat(
-        initialValue = 1f, targetValue = 2.4f,
-        animationSpec = infiniteRepeatable(tween(1800, delayMillis = 600, easing = LinearEasing), RepeatMode.Restart),
-        label = "ring2"
-    )
-    val ring3 by inf.animateFloat(
-        initialValue = 1f, targetValue = 2.4f,
-        animationSpec = infiniteRepeatable(tween(1800, delayMillis = 1200, easing = LinearEasing), RepeatMode.Restart),
-        label = "ring3"
-    )
-
-    // Thinking: spinning arc
-    val arcRotation by inf.animateFloat(
-        initialValue = 0f, targetValue = 360f,
-        animationSpec = infiniteRepeatable(tween(2000, easing = LinearEasing), RepeatMode.Restart),
-        label = "arcRot"
-    )
-
-    // Stars orbiting the orb (always active)
-    val orbitAngle by inf.animateFloat(
-        initialValue = 0f, targetValue = 360f,
-        animationSpec = infiniteRepeatable(tween(14000, easing = LinearEasing), RepeatMode.Restart),
-        label = "orbit"
-    )
-
-    val orbSize = 180.dp
-
-    Box(
-        Modifier.size(300.dp),
-        contentAlignment = Alignment.Center
-    ) {
-        // Rings (LISTENING only)
-        if (mood == MainActivity.Mood.LISTENING) {
-            listOf(ring1, ring2, ring3).forEach { s ->
-                val alpha = (1f - (s - 1f) / 1.4f).coerceIn(0f, 0.6f)
-                Box(
-                    Modifier
-                        .size(orbSize)
-                        .scale(s)
-                        .border(2.dp, CyanAccent.copy(alpha = alpha), CircleShape)
-                )
-            }
-        }
-
-        // Ambient glow halo
-        Box(
-            Modifier
-                .size(orbSize + 40.dp)
-                .background(
-                    Brush.radialGradient(
-                        listOf(orbColor.copy(alpha = 0.18f), Color.Transparent)
-                    ),
-                    CircleShape
-                )
-        )
-
-        // Orbiting stars
-        Canvas(Modifier.size(300.dp)) {
-            val cx = size.width / 2f
-            val cy = size.height / 2f
-            val orbPx = 90.dp.toPx()
-            ORBIT_STARS.forEach { star ->
-                val a = (if (star.reversed) -orbitAngle + star.a0Deg
-                         else orbitAngle + star.a0Deg) * DEG_TO_RAD
-                val r = orbPx * star.rMult
-                val x = cx + r * cos(a)
-                val y = cy + r * sin(a) * star.yScale
-                drawCircle(
-                    color = star.tint.copy(alpha = star.alpha),
-                    radius = star.dotR.dp.toPx(),
-                    center = Offset(x, y)
-                )
-            }
-        }
-
-        // Thinking: spinning arc on canvas
-        if (mood == MainActivity.Mood.THINKING) {
-            Canvas(Modifier.size(orbSize + 20.dp)) {
-                rotate(arcRotation) {
-                    drawArc(
-                        brush = Brush.sweepGradient(listOf(Color.Transparent, PrimaryViolet, Color.Transparent)),
-                        startAngle = 0f,
-                        sweepAngle = 160f,
-                        useCenter = false,
-                        style = Stroke(width = 3.dp.toPx())
-                    )
-                }
-            }
-        }
-
-        // Core orb
-        val coreScale = when (mood) {
-            MainActivity.Mood.LISTENING -> 1f
-            else                        -> breathe
-        }
-        Box(
-            Modifier
-                .size(orbSize)
-                .scale(coreScale)
-                .background(
-                    Brush.radialGradient(
-                        listOf(orbColor.copy(alpha = 0.9f), orbColor.copy(alpha = 0.5f))
-                    ),
-                    CircleShape
-                )
-                .border(
-                    width = 1.5.dp,
-                    brush = Brush.linearGradient(
-                        listOf(Color.White.copy(alpha = 0.3f), Color.White.copy(alpha = 0.05f))
-                    ),
-                    shape = CircleShape
-                )
-                .clickable(
-                    interactionSource = remember { MutableInteractionSource() },
-                    indication = null,
-                    onClick = onTap
-                ),
-            contentAlignment = Alignment.Center
-        ) {
-            // Inner glass highlight
-            Box(
-                Modifier
-                    .size(orbSize * 0.55f)
-                    .offset(x = (-12).dp, y = (-16).dp)
-                    .background(
-                        Brush.radialGradient(listOf(Color.White.copy(alpha = 0.15f), Color.Transparent)),
-                        CircleShape
-                    )
-            )
         }
     }
 }

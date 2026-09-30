@@ -11,8 +11,9 @@ cloud AI you pick — and she can fall back to a fully on-device LLM.
 - **Smart mode:** a cloud brain of your choice — Groq, Google Gemini, OpenAI, Anthropic Claude, or
   any OpenAI-compatible server (e.g. Ollama on your own PC) — hears every turn, answers in Naomi's
   (editable) personality and runs phone actions. Set it up in the app; no rebuild needed.
-- **Hands-free:** an offline **"Naomi" wake word** (Vosk) launches it from the lock screen, and a
-  voice lock makes her answer only to you.
+- **Hands-free:** an offline **"Naomi" wake word** (Vosk) launches it from the lock screen — or,
+  over another app, floats a small orb there instead of taking the screen — and a voice lock makes
+  her answer only to you.
 - **Conversation mode:** after she answers, the mic stays open — just keep talking.
 - **Long-term memory:** she learns what you tell her about yourself (people, plans, likes, routines),
   keeps a short note of each conversation, and brings back what's relevant when you talk again.
@@ -100,6 +101,10 @@ Grant the mic (and, for calls/messages, contacts + phone) permissions. Then try:
   my reminders?" and "cancel the dentist reminder" work too. "Add a dentist appointment tomorrow at
   3pm" puts it straight in your calendar (with calendar permission).
 - Turn on the **"Naomi" wake word** and say "Naomi" from the lock screen.
+- Say "Naomi" while another app is open: on an unlocked phone she floats over it in a small orb,
+  with a line of the conversation, and the app underneath keeps running. Drag the orb out of the
+  way (it stays where it's left), tap the arrow to carry on in her app, or turn it off in Settings
+  → *Float over other apps*. It needs "Display over other apps"; over the lock screen the app opens.
 - **Voice lock:** Settings → *Train my voice*: say "Naomi" 8 times.
   From then on only your voice wakes her — anyone else hears "Sorry, I don't recognize your voice.
   You're not authorized to use me." Training drops any clip that caught silence instead of the word.
