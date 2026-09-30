@@ -44,7 +44,8 @@ object PortugueseModel {
      * Whether the model can be held to a list of words (it has a runtime graph), as answer mode
      * needs: without one, Vosk would ignore the list and take anything it hears for an answer.
      */
-    fun takesGrammar(context: Context): Boolean = File(dir(context), "graph/Gr.fst").exists()
+    fun takesGrammar(context: Context): Boolean =
+        dir(context).let { File(it, "graph/Gr.fst").exists() || File(it, "Gr.fst").exists() }
 
     /** The model's state, from its files until a download starts. */
     fun state(context: Context): State {
@@ -101,9 +102,7 @@ object PortugueseModel {
             }
             part.deleteRecursively()
             unzip(zip, part)
-            for (needed in listOf("am/final.mdl", "conf/model.conf")) {
-                if (!File(part, needed).exists()) throw IOException("the model has no $needed")
-            }
+            if (!isModel(part)) throw IOException("the zip holds no Vosk model")
             val target = dir(context)
             target.deleteRecursively()
             if (!part.renameTo(target)) throw IOException("couldn't move the model into place")
@@ -113,6 +112,15 @@ object PortugueseModel {
             part.deleteRecursively()
         }
     }
+
+    /**
+     * Whether [dir] holds a Vosk model, in either layout Vosk reads: today's (am/final.mdl,
+     * conf/model.conf, graph/) or the older flat one (final.mdl, mfcc.conf, Gr.fst at the top),
+     * which this small Portuguese model, from 2020, still has.
+     */
+    internal fun isModel(dir: File): Boolean =
+        (File(dir, "am/final.mdl").exists() && File(dir, "conf/model.conf").exists()) ||
+            (File(dir, "final.mdl").exists() && File(dir, "mfcc.conf").exists())
 
     /** Unpacks [zip] into [into], without the model's own top folder ("vosk-model-small-pt-0.3/"). */
     private fun unzip(zip: File, into: File) {
