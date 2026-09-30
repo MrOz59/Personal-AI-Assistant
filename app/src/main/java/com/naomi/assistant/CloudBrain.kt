@@ -303,7 +303,7 @@ class CloudBrain(private val llm: LlmClient, private val persona: String) {
             val clock = SimpleDateFormat("EEEE", Locale.ENGLISH).format(now) + " $partOfDay: " +
                 SimpleDateFormat("d MMMM yyyy, h:mm a", Locale.ENGLISH).format(now)
             val name = ctx.facts["name"]?.takeIf { it.isNotBlank() }
-            // "their mom is Amma" reads unambiguously even to a small model; "mom = Amma" didn't.
+            // "their mom is Maria" reads unambiguously even to a small model; "mom = Maria" didn't.
             val known = ctx.facts.filterKeys { it != "name" }.entries.joinToString("; ") { (k, v) -> "their $k is $v" }
             appendLine(persona.trim())
             appendLine()
@@ -753,7 +753,7 @@ class CloudBrain(private val llm: LlmClient, private val persona: String) {
             Action("whatsapp_video", Field("name", "<contact>")),
             Action("send_sms", Field("name", "<contact>"), Field("message", "<their exact words>")),
             Action("whatsapp", Field("name", "<contact>"), Field("message", "<their exact words>")),
-            Action("play_music", Field("query", "<song or artist>"), Field("app", "<spotify|youtube|jiosaavn|gaana|wynk|>")),
+            Action("play_music", Field("query", "<song or artist>"), Field("app", "<spotify|youtube|apple music|amazon music|deezer|samsung music|>")),
             Action("music_control", Field("control", "<pause|resume|next|previous>")),
             // Hours/minutes/seconds rather than a seconds total: small models get unit conversion wrong.
             Action("set_timer", Field("hours", "<int>", true), Field("minutes", "<int>", true), Field("seconds", "<int>", true)),
@@ -767,8 +767,8 @@ class CloudBrain(private val llm: LlmClient, private val persona: String) {
             Action("directions", Field("destination", "<place, or empty for the one just discussed>"), Field("mode", "<walk|drive|transit|>")),
             Action("maps_search", Field("query", "<place or kind of place>")),
             Action("open_url", Field("url", "<website>")),
-            Action("ride", Field("destination", "<place>"), Field("app", "<uber|ola|rapido|>")),
-            Action("order_food", Field("query", "<food or restaurant>"), Field("app", "<swiggy|zomato|>")),
+            Action("ride", Field("destination", "<place>"), Field("app", "<uber|didi|>")),
+            Action("order_food", Field("query", "<food or restaurant>"), Field("app", "<uber eats|doordash|>")),
             Action("note", Field("text", "<note text>")),
             Action("email", Field("to", "<contact or address>"), Field("subject", "<text>"), Field("body", "<text>")),
             Action("weather", Field("city", "<city, or empty for where they are>"), Field("day", "<today|tomorrow|monday…>")),

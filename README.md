@@ -42,7 +42,7 @@ an Android phone (Android 8.0+). You'll need to allow "install from unknown sour
 **Requirements:** Android Studio (latest), a phone with Android 8.0+ (API 26) and USB debugging on.
 
 ```bash
-git clone https://github.com/mukeshchandu/Personal-AI-Assistant.git
+git clone https://github.com/MrOz59/Personal-AI-Assistant.git
 cd Personal-AI-Assistant
 ```
 
@@ -91,7 +91,7 @@ DuckDuckGo directly, which answers less.
 Grant the mic (and, for calls/messages, contacts + phone) permissions. Then try:
 - "set a timer for 2 minutes"  *(offline)*
 - "call \<contact\>" / "WhatsApp video call \<contact\>"  *(offline)*
-- "what's the weather in Bangalore"
+- "what's the weather in Sydney"
 - "who won the Palmeiras game last night?"  •  "quanto tá o dólar hoje?"  *(smart mode; see Web search above)*
 - "play \<song\>"  •  "open settings"
 - "remember that I parked on level 3" → later, "where did I park?"  •  "forget that"

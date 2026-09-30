@@ -916,8 +916,10 @@ class AssistantBrain(context: Context) {
             "navigate" -> router.executeNavigate(args.optString("destination"))
             "maps_search" -> router.executeMapsSearch(args.optString("query"))
             "open_url" -> router.executeOpenUrl(args.optString("url"))
-            "ride" -> router.executeRide(args.optString("destination"), args.optString("app"))
-            "order_food" -> router.executeFood(args.optString("query"), args.optString("app"))
+            "ride" -> router.executeRide(args.optString("destination"), args.optString("app"),
+                Language.current(appContext) == Language.PORTUGUESE)
+            "order_food" -> router.executeFood(args.optString("query"), args.optString("app"),
+                Language.current(appContext) == Language.PORTUGUESE)
             "note" -> router.executeNote(args.optString("text"))
             "email" -> router.executeEmail(memory.resolveContact(args.optString("to")), args.optString("subject"), args.optString("body"))
             "flashlight" -> router.executeTorch(args.optString("state", "on") != "off")
@@ -934,7 +936,6 @@ class AssistantBrain(context: Context) {
             "reminder_cancel" -> router.reminders.cancel(original, args.optString("what"))
             "voice_record_start" -> router.executeStartRecording()
             "voice_record_stop" -> router.executeStopRecording()
-            "course_check" -> router.executeCourseCheck()
             else -> router.tryHandle(original) // unknown action → try the keyword router
         }
         return resultToReply(result, say) { Reply("I'm not sure how to do that yet.") }
@@ -1119,10 +1120,10 @@ class AssistantBrain(context: Context) {
             "(tem|ter) jogo( \\S+){0,3} (hoje|amanhã|amanha|agora)|hoje tem jogo|" +
             "(d[óo]lar|euro|gasolina|bitcoin|a[çc][ãa]o|pre[çc]o)( \\S+){0,2} (tá|ta|está|esta) quanto|" +
             "(abre|fecha|funciona) (at[ée] )?que horas)\\b")
-        // Things to do, which may mention the game or the news: a reminder, an alarm, a message, a call.
+        // Things to do, which may mention the game or the news: a reminder, an alarm, a message, a call, a ride.
         private val COMMAND_PT = wordRegex("\\b(me lembr\\p{L}*|lembrete|alarme|despertador|timer|cron[ôo]metro|me acord\\p{L}*|" +
             "manda|mande|envia|envie|fala pr[oa]|diz pr[oa]|pergunta pr[oa]|(liga|ligar|ligue) (pr[oa]|para)|cria|crie|coloca|coloque|" +
-            "anota|anote|toca|toque)\\b")
+            "anota|anote|toca|toque|(chama|chame|pede|peça|peca) (um|uma))\\b")
         // "Pesquisa…", "busca na internet…", "dá um google no…": the words after are the search. A bare
         // "busca" is as often "pick up" ("buscar minha mãe no aeroporto"), so it needs somewhere to search.
         private val SEARCH_REQUEST_PT = wordRegex("^(?:(?:(?:você|voce|vc) )?(?:pode|consegue|poderia|podia) |por favor )*" +

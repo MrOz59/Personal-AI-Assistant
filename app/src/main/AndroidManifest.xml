@@ -85,15 +85,13 @@
         </intent>
         <package android:name="com.whatsapp" />
         <package android:name="com.spotify.music" />
-        <package android:name="com.jio.media.jiobeats" />
+        <package android:name="com.google.android.apps.youtube.music" />
         <package android:name="com.google.android.apps.maps" />
+        <!-- Ride and food apps: see ServiceApps.kt -->
         <package android:name="com.ubercab" />
-        <package android:name="com.olacabs.customer" />
-        <package android:name="com.rapido.passenger" />
-        <package android:name="in.swiggy.android" />
-        <package android:name="com.swiggy.android" />
-        <package android:name="com.application.zomato" />
-        <package android:name="com.application.zomato.district" />
+        <package android:name="com.didiglobal.passenger" />
+        <package android:name="com.ubercab.eats" />
+        <package android:name="com.dd.doordash" />
         <package android:name="com.google.android.keep" />
     </queries>
 
