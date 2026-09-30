@@ -76,6 +76,8 @@ class AssistantBrain(context: Context) {
     // of it was real talk rather than quick commands. [chatTurn] marks the turn in progress as talk.
     private val conversation = ArrayDeque<Pair<String, String>>()
     private var talked = false
+    // The language of the last turn: a turn in another one starts a new conversation.
+    private var lastLanguage: Language? = null
     private var chatTurn = false
     private var lastTurnAt = 0L
 
@@ -127,9 +129,12 @@ class AssistantBrain(context: Context) {
         val heardAs = if (userText == heard) alternatives else listOf(heard) + (alternatives - userText)
         if (userText != heard) android.util.Log.i("Naomi", "Took the recognizer's other guess: \"$userText\" over \"$heard\"")
         val now = System.currentTimeMillis()
-        // A long pause ends a conversation: it gets noted down, and the next one starts fresh.
-        if (history.isNotEmpty() && now - lastTurnAt > CONVERSATION_GAP_MS) cancel()
+        // A long pause ends a conversation: it gets noted down, and the next one starts fresh. So
+        // does a change of language: the talk so far would pull her replies back into the old one.
+        val language = Language.current(appContext)
+        if (history.isNotEmpty() && (now - lastTurnAt > CONVERSATION_GAP_MS || language != lastLanguage)) cancel()
         lastTurnAt = now
+        lastLanguage = language
         memories.ownerName = memory.get("name")
         val herLastLine = history.lastOrNull()?.second
         chatTurn = false

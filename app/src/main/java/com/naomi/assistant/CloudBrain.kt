@@ -309,8 +309,11 @@ class CloudBrain(private val llm: LlmClient, private val persona: String) {
             appendLine()
             appendLine("HOW YOU TALK")
             appendLine("You're speaking out loud through a phone; a text-to-speech voice reads every word you write.")
-            ctx.language.replyIn?.let {
-                appendLine("- Always reply in $it: the user talks to you in it, and a $it voice reads your words.")
+            // Said for English too: after a switch, the conversation so far can be in the other
+            // language, and a small model carries on in whatever the history is in.
+            (ctx.language.replyIn ?: "English").let {
+                appendLine("- Always reply in $it, even if earlier messages were in another language: the user talks to " +
+                    "you in it, and a $it voice reads your words.")
             }
             appendLine("- Sound like a friend on a call, not a search engine: contractions, natural rhythm, real reactions.")
             appendLine("- Put some of yourself in every reply — a quip, an opinion, a bit of warmth, or a question back.")

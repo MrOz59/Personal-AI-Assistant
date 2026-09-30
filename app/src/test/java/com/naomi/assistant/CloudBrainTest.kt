@@ -176,7 +176,9 @@ class CloudBrainTest {
         )) {
             assertTrue(prompt.contains("Always reply in Brazilian Portuguese"))
         }
-        assertFalse(CloudBrain.systemPrompt("You are Naomi.", TurnContext(mapOf("name" to "Ozzy")), Date(0)).contains("Always reply in"))
+        // English is said too: after a switch, the history can still be in Portuguese.
+        assertTrue(CloudBrain.systemPrompt("You are Naomi.", TurnContext(mapOf("name" to "Ozzy")), Date(0))
+            .contains("Always reply in English, even if earlier messages were in another language"))
     }
 
     @Test

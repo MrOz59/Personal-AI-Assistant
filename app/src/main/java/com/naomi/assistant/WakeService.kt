@@ -459,6 +459,9 @@ class WakeService : Service() {
         cooldownUntil = System.currentTimeMillis() + 3000
         firing = true // hold further triggers while we decide
         if (!enrollment.isEnrolled) {
+            // Logged like a checked one, so a wake nobody asked for can be traced to what set it off.
+            VoiceLog.add(this, "\"$phrase\" (word ${"%.2f".format(hit.conf)}, ${cuts.note}): woke — no voice lock")
+            verifier.execute { VoiceDebug.keep(this, "wake", cuts.audio, cuts.info.put("voice_lock", false)) }
             main.post { onWakeAccepted(phrase) }
             return
         }

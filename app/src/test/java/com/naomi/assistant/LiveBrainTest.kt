@@ -293,6 +293,20 @@ class LiveBrainTest {
         println("SUMMARY: $ok/${cases.size}")
     }
 
+    /** Switched to English with the talk so far in Portuguese: does she answer in English? */
+    @Test
+    fun englishAfterPortuguese() {
+        val brain = CloudBrain(liveClient() ?: return, BrainSettings.DEFAULT_PERSONA)
+        val history = listOf(
+            "vai chover amanhã" to "Amanhã em Cromer vai ser nublado, com máxima de 28 e mínima de 14, sem chuva.",
+            "em nome" to "Ahah, parece que o reconhecimento de voz está confuso hoje! Você está falando comigo?",
+        )
+        for (said in listOf("I was talking to somebody else, not to you", "tell me a joke", "how's your day going?")) {
+            val reply = runBlocking { brain.respond(said, history, TurnContext(mapOf("name" to "Ozzy"), language = Language.ENGLISH)) }
+            println("\"$said\" → ${reply.action ?: reply.say.take(140)}")
+        }
+    }
+
     /** The brain from NAOMI_LLM_URL / _MODEL / _KEY, or null (test skipped) when it isn't set. */
     private fun liveClient(): LlmClient? {
         val url = System.getenv("NAOMI_LLM_URL")
