@@ -398,8 +398,9 @@ class Conversation private constructor(private val app: Context) {
                 Regex("\\b(on|enable|turn|start)\\b").containsMatchIn(lower)
 
         fun needsLocation(lower: String): Boolean =
-            Regex("\\b(uber|ola|rapido|cab|ride|taxi|swiggy|zomato|navigate|directions|near me)\\b")
-                .containsMatchIn(lower) || lower.contains("take me to") || lower.contains("order food")
+            ServiceApps.isRideRequest(lower) || ServiceApps.isFoodRequest(lower) ||
+                Regex("\\b(cab|ride|taxi|navigate|directions|near me)\\b").containsMatchIn(lower) ||
+                lower.contains("take me to")
 
         /** Recognizes "place order / tap X / select X / scroll down / type X" style commands. */
         fun parseScreenControl(lower: String): ScreenCmd? = when {

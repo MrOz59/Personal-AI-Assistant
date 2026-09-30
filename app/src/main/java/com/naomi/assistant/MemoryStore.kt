@@ -8,7 +8,7 @@ import java.io.File
  * Persistent key→value fact store (naomi_facts.json in internal storage).
  * Keys are normalised to lowercase so "Mom", "mom", "MOM" all resolve the same way.
  *
- * Typical entries: {"mom":"Amma","dad":"Papa","home":"HSR Layout"}
+ * Typical entries: {"mom":"Maria","dad":"João","home":"Bondi"}
  */
 class MemoryStore(context: Context) {
 
@@ -50,14 +50,14 @@ class MemoryStore(context: Context) {
 
     /**
      * Resolves a contact name spoken by the user.
-     * If [name] itself is a stored key (e.g. "mom"), returns the mapped value ("Amma").
+     * If [name] itself is a stored key (e.g. "mom"), returns the mapped value ("Maria").
      * Otherwise returns [name] unchanged so normal contact lookup proceeds.
      */
     fun resolveContact(name: String): String {
         val lower = name.trim().lowercase()
-        // Direct match: "mom" → "Amma"
+        // Direct match: "mom" → "Maria"
         facts[lower]?.let { return it }
-        // Prefix match: "my mom" → strip "my " → "Amma"
+        // Prefix match: "my mom" → strip "my " → "Maria"
         val stripped = lower.removePrefix("my ").removePrefix("the ")
         facts[stripped]?.let { return it }
         return name
@@ -66,10 +66,10 @@ class MemoryStore(context: Context) {
     /**
      * Tries to parse a spoken fact statement into a key→value pair and stores it.
      * Patterns handled:
-     *   "my mom is Amma"            → mom → Amma
-     *   "my mom's contact is Amma"  → mom → Amma
-     *   "mom is saved as Amma"      → mom → Amma
-     *   "remember mom is Amma"      → mom → Amma
+     *   "my mom is Maria"           → mom → Maria
+     *   "my mom's contact is Maria" → mom → Maria
+     *   "mom is saved as Maria"     → mom → Maria
+     *   "remember mom is Maria"     → mom → Maria
      * Returns a confirmation string to speak, or null if the text didn't match.
      */
     fun learnFromSpeech(text: String): String? {

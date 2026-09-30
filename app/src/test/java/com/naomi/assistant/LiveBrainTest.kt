@@ -29,7 +29,7 @@ class LiveBrainTest {
         )
         // The app's own brain logic, including the second conversation pass for small models.
         val brain = CloudBrain(client, BrainSettings.DEFAULT_PERSONA)
-        val facts = mapOf("name" to "Ozzy", "mom" to "Amma", "city" to "Sydney")
+        val facts = mapOf("name" to "Ozzy", "mom" to "Maria", "city" to "Sydney")
         val cases = listOf(
             "hey Naomi, how's it going?" to null,
             "tell me a joke" to null,
@@ -104,7 +104,7 @@ class LiveBrainTest {
             selfHosted = System.getenv("NAOMI_LLM_HOSTED") != "1"
         )
         val brain = CloudBrain(client, BrainSettings.DEFAULT_PERSONA)
-        val facts = mapOf("name" to "Ozzy", "mom" to "Amma")
+        val facts = mapOf("name" to "Ozzy", "mom" to "Maria")
         val history = mutableListOf<Pair<String, String>>()
         for (line in listOf(
             "hey Naomi, I just got home from work",
@@ -324,7 +324,7 @@ class LiveBrainTest {
         assumeTrue("NAOMI_DUMP_DIR not set", !dir.isNullOrBlank())
         val prompt = CloudBrain.systemPrompt(
             BrainSettings.DEFAULT_PERSONA,
-            TurnContext(mapOf("name" to "Ozzy", "mom" to "Amma", "city" to "Sydney")),
+            TurnContext(mapOf("name" to "Ozzy", "mom" to "Maria", "city" to "Sydney")),
             Date()
         )
         java.io.File(dir!!, "system_prompt.txt").writeText(prompt)
