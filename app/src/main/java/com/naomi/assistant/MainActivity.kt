@@ -549,7 +549,7 @@ class MainActivity : ComponentActivity(), Conversation.Host {
             val hiss = java.util.Random(5)
             val audio = ShortArray(leadMs * 16) { (hiss.nextInt(7) - 3).toShort() } + speech
             VoiceLog.add(this, "STT test: \"$text\" after $leadMs ms of quiet (${speech.size / 16} ms of speech, " +
-                "${intent.getStringExtra("lang") ?: "en-IN"})")
+                "${intent.getStringExtra("lang") ?: Language.speechTag(this)})")
             voice.listenToAudio(audio, intent.getStringExtra("lang"),
                 onResult = { heard -> VoiceLog.add(this, "STT test heard: \"${heard.text}\"") },
                 onError = { message -> VoiceLog.add(this, "STT test failed: $message") })
@@ -1039,7 +1039,7 @@ class MainActivity : ComponentActivity(), Conversation.Host {
 
     /**
      * One-shot fact-entry mode: listen once, try to parse a fact statement, store it.
-     * Example: "my mom is Amma" → stores mom→Amma. Triggered from the Add Fact page.
+     * Example: "my mom is Maria" → stores mom→Maria. Triggered from the Add Fact page.
      */
     private fun startFactMode() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
@@ -1053,14 +1053,14 @@ class MainActivity : ComponentActivity(), Conversation.Host {
         if (wakeEnabled) WakeService.pause(this)
         speaker.stop()
         enterMood(Mood.LISTENING)
-        status = "Say a fact — e.g. \"my mom is Amma\""
+        status = "Say a fact — e.g. \"my mom is Maria\""
         voice.listen(
             onResult = { heard ->
                 val spoken = heard.text
                 factMode = false
                 enterMood(Mood.SPEAKING)
                 val confirmation = brain.memory.learnFromSpeech(spoken)
-                    ?: "Sorry, I didn't understand that as a fact. Try saying \"my mom is Amma\"."
+                    ?: "Sorry, I didn't understand that as a fact. Try saying \"my mom is Maria\"."
                 android.util.Log.i("Naomi", "Fact input: \"$spoken\" → $confirmation")
                 facts = brain.memory.all()
                 if (facts.isNotEmpty()) screen = Screen.FACTS
@@ -1517,7 +1517,7 @@ private fun FactsScreen(
                     )
                     Spacer(Modifier.height(6.dp))
                     Text(
-                        "Teach Naomi shortcuts like \"mom → Amma\", say \"remember that…\", or just talk — " +
+                        "Teach Naomi shortcuts like \"mom → Maria\", say \"remember that…\", or just talk — " +
                             "in smart mode she picks things up as you go.",
                         fontFamily = InterFamily, fontSize = 13.sp,
                         color = OnSurfaceVariant.copy(alpha = 0.6f), textAlign = TextAlign.Center
@@ -1600,7 +1600,7 @@ private fun FactCard(
         } else {
             NaomiTextField(value = keyText, onValueChange = { keyText = it }, label = "Name (e.g. mom)")
             Spacer(Modifier.height(10.dp))
-            NaomiTextField(value = valueText, onValueChange = { valueText = it }, label = "Value (e.g. Amma)")
+            NaomiTextField(value = valueText, onValueChange = { valueText = it }, label = "Value (e.g. Maria)")
             Spacer(Modifier.height(12.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 PillButton(
@@ -1725,7 +1725,7 @@ private fun AddFactScreen(
             )
 
             NaomiTextField(value = keyText, onValueChange = { keyText = it }, label = "Name — e.g. mom, home, music app")
-            NaomiTextField(value = valueText, onValueChange = { valueText = it }, label = "Value — e.g. Amma, HSR Layout, Wynk")
+            NaomiTextField(value = valueText, onValueChange = { valueText = it }, label = "Value — e.g. Maria, Bondi, Spotify")
 
             PillButton(
                 text = "Save fact", icon = Icons.Outlined.Check, accent = PrimaryViolet,
@@ -1748,7 +1748,7 @@ private fun AddFactScreen(
                 filled = false
             ) { onVoiceFact() }
             Text(
-                "Tip: say \"my mom is Amma\" and Naomi will store it for you.",
+                "Tip: say \"my mom is Maria\" and Naomi will store it for you.",
                 fontFamily = InterFamily, fontSize = 12.sp,
                 color = OnSurfaceVariant.copy(alpha = 0.5f)
             )

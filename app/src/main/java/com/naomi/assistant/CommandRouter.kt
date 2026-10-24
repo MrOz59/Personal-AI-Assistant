@@ -42,7 +42,7 @@ class CommandRouter(private val context: Context) {
 
     /**
      * Preferred music app — set from MemoryStore before each routing call.
-     * When set (e.g. "Wynk"), play requests without an explicit app target use it.
+     * When set (e.g. "Spotify"), play requests without an explicit app target use it.
      */
     var preferredMusicApp: String = ""
 
@@ -107,12 +107,6 @@ class CommandRouter(private val context: Context) {
             input.contains("calendar") || input.contains("my schedule") ||
                 (input.contains("event") && input.contains("today")) -> handleCalendarRead()
 
-            // --- course watcher ---
-            input.contains("course") && (input.contains("check") || input.contains("new") ||
-                input.contains("added") || input.contains("available") || input.contains("any") ||
-                input.contains("watcher")) ->
-                executeCourseCheck()
-
             // --- system settings by voice ("take me to accessibility settings") ---
             // Requires an opener verb so it won't grab "settings" in unrelated commands.
             input.contains("settings") && (input.contains("open") || input.contains("go to") ||
@@ -128,18 +122,15 @@ class CommandRouter(private val context: Context) {
             (input.startsWith("google ") || input == "google" || input.contains("search for") ||
                 Regex("\\b(search the web|look up|look it up)\\b").containsMatchIn(input) ||
                 Regex("\\bsearch\\b").containsMatchIn(input)) &&
-                // Not a "search X in <app>" request — those are handled by the app below.
-                !Regex("\\b(swiggy|zomato|uber|ola|rapido|youtube|amazon|flipkart)\\b").containsMatchIn(input) ->
+                // Not a "search X in <app>" request — those are handled by the app below — unless
+                // it's plainly for the web ("google DoorDash", "look up DoorDash's hours").
+                !Regex("\\b(youtube|amazon)\\b").containsMatchIn(input) && (!ServiceApps.namesRideOrFood(input) ||
+                    input.startsWith("google ") || Regex("\\b(search the web|look up|look it up)\\b").containsMatchIn(input)) ->
                 executeWebSearch(firstAfter(input, "search for", "google", "look up", "search"))
 
-            // --- rides / food / notes / email / device controls ---
-            RIDE_APPS.containsMatchIn(input) ||
-                ((input.contains("book") || input.contains("get me")) &&
-                    (input.contains("cab") || input.contains("ride") || input.contains("taxi"))) ->
-                handleRide(input)
-            input.contains("swiggy") || input.contains("zomato") ||
-                (input.contains("order") && input.contains("food")) ->
-                handleFood(input)
+            // --- food / rides / notes / email / device controls (food first: "Uber Eats" isn't a ride) ---
+            ServiceApps.isFoodRequest(input) -> handleFood(input)
+            ServiceApps.isRideRequest(input) -> handleRide(input)
             input.contains("take a note") || input.contains("make a note") ||
                 input.contains("note that") || input.contains("write down") || input.contains("note down") ->
                 handleNote(input)
@@ -166,7 +157,7 @@ class CommandRouter(private val context: Context) {
                 input.contains("silent mode") || input.contains("vibrate mode") ||
                 input == "silent" || input == "vibrate" -> handleRinger(input)
 
-            // Match "call" / "open" anywhere, so "hey can you call balaji" still works.
+            // Match "call" / "open" anywhere, so "hey can you call maria" still works.
             Regex("\\bcall\\b").containsMatchIn(input) -> handleCall(extractAfter(input, "call"))
             Regex("\\bopen\\b").containsMatchIn(input) -> handleOpenApp(extractAfter(input, "open"))
             else -> Result.NotHandled
@@ -220,30 +211,29 @@ class CommandRouter(private val context: Context) {
     }
 
     fun executePlay(query: String, app: String): Result {
-        if (query.isBlank()) return mediaKey(KeyEvent.KEYCODE_MEDIA_PLAY, "Playing.")
-
         // Explicit app target
-        val (explicitPkg, where) = when {
-            app.contains("spotify") -> "com.spotify.music" to " on Spotify"
-            app.contains("saavn") || app.contains("jio") -> "com.jio.media.jiobeats" to " on JioSaavn"
-            app.contains("gaana") -> "com.gaana" to " on Gaana"
-            app.contains("wynk") -> "com.wynk.music" to " on Wynk"
-            app.contains("youtube") -> "com.google.android.apps.youtube.music" to " on YouTube Music"
-            app.contains("resso") -> "com.resso.app" to " on Resso"
-            else -> null to ""
+        val explicit = ServiceApps.named(ServiceApps.MUSIC, app)
+        if (query.isBlank()) {
+            if (explicit == null) return mediaKey(KeyEvent.KEYCODE_MEDIA_PLAY, "Playing.")
+            // "Play Spotify": an empty search is the platform's "play something" in that app.
+            val anything = Intent(MediaStore.INTENT_ACTION_MEDIA_PLAY_FROM_SEARCH)
+                .putExtra(SearchManager.QUERY, "").setPackage(explicit.pkg).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            return try {
+                context.startActivity(anything)
+                Result.Handled("Playing on ${explicit.label}.")
+            } catch (_: Exception) {
+                context.packageManager.getLaunchIntentForPackage(explicit.pkg)
+                    ?.let { launch(it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK), "Opening ${explicit.label}.") }
+                    ?: Result.Handled("${explicit.label} isn't installed.")
+            }
         }
+        val where = explicit?.let { " on ${it.label}" } ?: ""
 
-        val targetPkg = explicitPkg ?: run {
+        val targetPkg = explicit?.pkg
             // Honour the user's stored "my music app is X" preference first.
-            val pref = preferredMusicApp.lowercase()
-            val prefPkg = if (pref.isNotBlank()) APP_TO_PKG.entries
-                .firstOrNull { (name, _) -> pref.contains(name) || name.contains(pref) }?.value
-            else null
-
+            ?: ServiceApps.favouriteMusic(preferredMusicApp)?.pkg
             // Fall back to first installed app in preference order.
-            prefPkg ?: APP_TO_PKG.values
-                .firstOrNull { context.packageManager.getLaunchIntentForPackage(it) != null }
-        }
+            ?: ServiceApps.MUSIC.firstOrNull { isInstalled(it.pkg) }?.pkg
 
         val intent = Intent(MediaStore.INTENT_ACTION_MEDIA_PLAY_FROM_SEARCH).apply {
             putExtra(MediaStore.EXTRA_MEDIA_FOCUS, "vnd.android.cursor.item/*")
@@ -319,77 +309,77 @@ class CommandRouter(private val context: Context) {
         )
     }
 
-    /** Book a ride — opens Uber/Ola/Rapido with the dropoff pre-filled where supported. */
-    fun executeRide(destination: String, app: String): Result {
-        return when {
-            // Rapido/Ola have no reliable public deep link for the drop location, so we open
-            // the app and drive the UI with the Accessibility service: tap the drop field, type.
-            app.contains("rapido") -> openRideWithDestination(
-                "com.rapido.passenger", "Rapido", destination,
-                "where to|drop|enter drop|drop location|where are you going|destination|search"
-            )
-            OLA.containsMatchIn(app) -> openRideWithDestination(
-                "com.olacabs.customer", "Ola", destination,
-                "where to|drop|enter drop|drop location|destination|search"
-            )
-            else -> { // Uber — supports a formatted_address deep link
-                if (destination.isNotBlank()) {
-                    try {
-                        context.startActivity(
-                            Intent(Intent.ACTION_VIEW, Uri.parse(
-                                "uber://?action=setPickup&pickup=my_location&dropoff[formatted_address]=${Uri.encode(destination)}"
-                            )).setPackage("com.ubercab").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                        )
-                        return Result.Handled("Opening Uber to $destination.")
-                    } catch (_: Exception) {}
-                }
-                openAppOrStore("com.ubercab", "Uber")
-            }
-        }
+    /**
+     * Opens a ride app — [app] if one is named, else the first installed — with the drop-off
+     * filled in where possible. Replies in Portuguese when [portuguese].
+     */
+    fun executeRide(destination: String, app: String, portuguese: Boolean = false): Result {
+        val ride = ServiceApps.pick(ServiceApps.RIDES, app, ::isInstalled)
+        // Home is saved in the app: typed in as an address, it'd look for a place called "home".
+        val place = if (ServiceApps.isHome(destination)) "" else destination
+        return openAndFill(
+            ride, place, portuguese,
+            // "Pro aeroporto" leaves no article to say, so the Portuguese line names the place alone.
+            filled = if (portuguese) "Abrindo o ${ride.label}. Destino: $place."
+                else "Opening ${ride.label} to $place.",
+            fillLater = if (portuguese) "Se você ligar a Naomi em Acessibilidade, da próxima vez eu já coloco o destino."
+                else "Turn on Naomi in Accessibility and I can fill in the destination for you next time.",
+        )
+    }
+
+    /** Opens a food-delivery app — [app] if one is named, else the first installed — searching for [query] in it. */
+    fun executeFood(query: String, app: String, portuguese: Boolean = false): Result {
+        val food = ServiceApps.pick(ServiceApps.FOOD, app, ::isInstalled)
+        return openAndFill(
+            food, query, portuguese,
+            filled = if (portuguese) "Abrindo o ${food.label} e procurando $query."
+                else "Opening ${food.label} and searching for $query.",
+            fillLater = if (portuguese) "Se você ligar a Naomi em Acessibilidade, da próxima vez eu já faço a busca."
+                else "Turn on Naomi in Accessibility and I can search for it next time.",
+        )
     }
 
     /**
-     * Opens a ride app; if a destination is given and the Accessibility service is on, it drives
-     * the app's own UI — taps the drop-location field and types the destination — since these
-     * apps expose no external deep link for the drop. Without accessibility, it just opens the app.
+     * Opens [app] (its Play Store page if it isn't installed) with [text] — a destination or a
+     * dish — filled in: through the app's link when it has one, else by driving its own screen
+     * with the Accessibility service (tap the field, type), since most take no link for it.
+     * [filled] is the reply when it's filled in, [fillLater] what to add when it can't be.
      */
-    private fun openRideWithDestination(
-        pkg: String, label: String, destination: String, tapTargets: String
+    private fun openAndFill(
+        app: ServiceApps.App, text: String, portuguese: Boolean, filled: String, fillLater: String
     ): Result {
-        val installed = context.packageManager.getLaunchIntentForPackage(pkg) != null
-        val opened = openAppOrStore(pkg, label)
-        if (installed && destination.isNotBlank() && opened is Result.Handled) {
-            if (WhatsAppSender.isEnabled) {
-                // Give the app time to cold-start before poking its search field.
-                val h = Handler(Looper.getMainLooper())
-                h.postDelayed({ WhatsAppSender.perform("tap", tapTargets) }, 4200)
-                h.postDelayed({ WhatsAppSender.perform("type", destination) }, 6000)
-                return Result.Handled("Opening $label — setting your drop to $destination.")
-            }
-            return Result.Handled(
-                "Opening $label. Turn on Naomi in Accessibility and I can fill the drop for you next time."
+        val opening = if (portuguese) "Abrindo o ${app.label}." else "Opening ${app.label}."
+        val appIntent = context.packageManager.getLaunchIntentForPackage(app.pkg)
+            ?: return launch(
+                Intent(Intent.ACTION_VIEW, Uri.parse("https://play.google.com/store/apps/details?id=${app.pkg}"))
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                if (portuguese) "O ${app.label} não está instalado, então abri a Play Store."
+                else "${app.label} isn't installed — opening the Play Store."
             )
+        if (text.isNotBlank() && app.link.isNotEmpty()) {
+            try {
+                context.startActivity(
+                    Intent(Intent.ACTION_VIEW, Uri.parse(app.link.replace("{}", Uri.encode(text))))
+                        .setPackage(app.pkg).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+                return Result.Handled(filled)
+            } catch (_: Exception) { /* opened plainly below */ }
         }
-        return opened
+        try {
+            context.startActivity(appIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        } catch (_: Exception) {
+            return Result.Handled(if (portuguese) "Não consegui abrir o ${app.label}." else "I couldn't open ${app.label}.")
+        }
+        if (text.isBlank() || app.fillTargets.isEmpty()) return Result.Handled(opening)
+        if (!WhatsAppSender.isEnabled) return Result.Handled("$opening $fillLater")
+        // Give the app time to cold-start before poking its field.
+        val h = Handler(Looper.getMainLooper())
+        h.postDelayed({ WhatsAppSender.perform("tap", app.fillTargets) }, FILL_TAP_MS)
+        h.postDelayed({ WhatsAppSender.perform("type", text) }, FILL_TYPE_MS)
+        return Result.Handled(filled)
     }
 
-    /** Open a food-delivery app (Swiggy/Zomato); if a dish is named, search for it in-app. */
-    fun executeFood(query: String, app: String): Result {
-        val (label, result) = if (app.contains("zomato"))
-            "Zomato" to openFirstInstalled(listOf("com.application.zomato", "com.application.zomato.district"), "Zomato")
-        else
-            "Swiggy" to openFirstInstalled(listOf("in.swiggy.android", "com.swiggy.android"), "Swiggy")
-
-        if (result is Result.Handled && query.isNotBlank() && WhatsAppSender.isEnabled) {
-            // Best-effort in-app search: wait for the app to load, tap the search box, type the dish.
-            val h = Handler(Looper.getMainLooper())
-            val searchTargets = "search|search for|find|what's|craving|dishes|restaurants|grocery"
-            h.postDelayed({ WhatsAppSender.perform("tap", searchTargets) }, 3800)
-            h.postDelayed({ WhatsAppSender.perform("type", query) }, 5400)
-            return Result.Handled("Opening $label and searching for $query.")
-        }
-        return result
-    }
+    private fun isInstalled(pkg: String): Boolean = context.packageManager.getLaunchIntentForPackage(pkg) != null
 
     /** Save a quick note in Google Keep (or a chooser if Keep isn't installed). */
     fun executeNote(text: String): Result {
@@ -493,37 +483,6 @@ class CommandRouter(private val context: Context) {
     fun isLocationEnabled(): Boolean {
         val lm = context.getSystemService(Context.LOCATION_SERVICE) as android.location.LocationManager
         return LocationManagerCompat.isLocationEnabled(lm)
-    }
-
-    /** Launches the first installed package among [pkgs]; if none, opens the Play Store. */
-    private fun openFirstInstalled(pkgs: List<String>, label: String): Result {
-        for (pkg in pkgs) {
-            val li = context.packageManager.getLaunchIntentForPackage(pkg) ?: continue
-            li.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            try { context.startActivity(li); return Result.Handled("Opening $label.") }
-            catch (e: Exception) { /* try next */ }
-        }
-        return launch(
-            Intent(Intent.ACTION_VIEW, Uri.parse("https://play.google.com/store/apps/details?id=${pkgs.first()}"))
-                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-            "$label isn't installed — opening the Play Store."
-        )
-    }
-
-    /** Launches an installed app by package; if missing, opens its Play Store page. */
-    private fun openAppOrStore(pkg: String, label: String): Result {
-        val launchIntent = context.packageManager.getLaunchIntentForPackage(pkg)
-        return if (launchIntent != null) {
-            launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            try { context.startActivity(launchIntent); Result.Handled("Opening $label.") }
-            catch (e: Exception) { Result.Handled("I couldn't open $label.") }
-        } else {
-            launch(
-                Intent(Intent.ACTION_VIEW, Uri.parse("https://play.google.com/store/apps/details?id=$pkg"))
-                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-                "$label isn't installed — opening the Play Store."
-            )
-        }
     }
 
     /**
@@ -727,7 +686,7 @@ class CommandRouter(private val context: Context) {
 
     // --- music ---------------------------------------------------------------
 
-    /** Sends a media key to whatever music app is active (Spotify, JioSaavn, etc.). */
+    /** Sends a media key to whatever music app is active (Spotify, YouTube Music, etc.). */
     private fun mediaKey(keyCode: Int, reply: String): Result {
         val am = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
         am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, keyCode))
@@ -736,21 +695,17 @@ class CommandRouter(private val context: Context) {
     }
 
     /**
-     * "play <something>" -> universal play-from-search intent that Spotify, JioSaavn,
-     * YT Music etc. all understand. "on spotify"/"on jiosaavn" targets that specific app.
+     * "play <something>" -> universal play-from-search intent that Spotify, YouTube Music etc.
+     * all understand. "on spotify"/"on youtube music" targets that specific app.
      */
     private fun handlePlay(input: String): Result {
         var query = extractAfter(input, "play")
-        val app = when {
-            query.contains("spotify") -> "spotify"
-            query.contains("saavn") || query.contains("jio") -> "jiosaavn"
-            else -> ""
-        }
+        val app = ServiceApps.named(ServiceApps.MUSIC, query)
+        if (app != null) query = ServiceApps.without(query, app)
         query = query
-            .replace(Regex("\\b(on|from)\\s+(the\\s+)?(spotify|jio\\s?saavn|jio|saavn)\\b"), "")
             .replace(Regex("^(the |a |some )?(song|track|music)\\b\\s*"), "") // drop "the song" filler
             .trim()
-        return executePlay(query, app)
+        return executePlay(query, app?.id.orEmpty())
     }
 
     // --- messaging -----------------------------------------------------------
@@ -768,7 +723,7 @@ class CommandRouter(private val context: Context) {
         // Split on the first "that / saying / to say": everything before is the recipient
         // (after we strip command + filler words), everything after is the message body.
         val sep = Regex("\\b(that|saying|to say)\\b").find(input)
-            ?: return Result.Handled("Tell me who and what — like \"message Balaji saying I'm running late\".")
+            ?: return Result.Handled("Tell me who and what — like \"message Maria saying I'm running late\".")
         val before = input.substring(0, sep.range.first)
         val body = input.substring(sep.range.last + 1).trim()
         val name = before
@@ -779,7 +734,7 @@ class CommandRouter(private val context: Context) {
             .replace(Regex("\\s+"), " ").trim()
 
         if (name.isBlank() || body.isBlank()) {
-            return Result.Handled("Tell me who and what — like \"message Balaji saying I'm running late\".")
+            return Result.Handled("Tell me who and what — like \"message Maria saying I'm running late\".")
         }
         return executeMessage(name, body, channel)
     }
@@ -845,24 +800,14 @@ class CommandRouter(private val context: Context) {
         return executeCalendarCreate(title.ifBlank { said.trim() }, at, ReminderParser.isPortuguese(said))
     }
 
-    private fun handleRide(input: String): Result {
-        val app = when {
-            OLA.containsMatchIn(input) -> "ola"
-            input.contains("rapido") -> "rapido"
-            else -> "uber"
-        }
-        return executeRide(firstAfter(input, "to"), app)
-    }
+    // In the language she speaks: "pede comida" has no word that tells it from English.
+    private fun handleRide(input: String): Result =
+        executeRide(ServiceApps.destination(input), ServiceApps.named(ServiceApps.RIDES, input)?.id.orEmpty(),
+            Language.current(context) == Language.PORTUGUESE)
 
-    private fun handleFood(input: String): Result {
-        val app = if (input.contains("zomato")) "zomato" else "swiggy"
-        // Strip command/app filler down to the dish/restaurant to search for (may be blank).
-        val query = input
-            .replace(Regex("\\b(search for|search|order|food|from|in|on|me|please|a|the|some|for)\\b"), " ")
-            .replace(Regex("\\b(swiggy|zomato)\\b"), " ")
-            .replace(Regex("\\s+"), " ").trim()
-        return executeFood(query, app)
-    }
+    private fun handleFood(input: String): Result =
+        executeFood(ServiceApps.dish(input), ServiceApps.named(ServiceApps.FOOD, input)?.id.orEmpty(),
+            Language.current(context) == Language.PORTUGUESE)
 
     private fun handleNote(input: String): Result {
         val text = firstAfter(
@@ -1050,24 +995,6 @@ class CommandRouter(private val context: Context) {
         return names
     }
 
-    /** Open the CourseWatcher app; fall back to the IITM portal if not installed. */
-    fun executeCourseCheck(): Result {
-        for (pkg in listOf("com.naomi.coursewatcher", "com.iitm.coursewatcher",
-                           "com.chandu.coursewatcher")) {
-            val li = context.packageManager.getLaunchIntentForPackage(pkg) ?: continue
-            li.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            try {
-                context.startActivity(li)
-                return Result.Handled("Opening Course Watcher — check it for any newly added courses.")
-            } catch (_: Exception) {}
-        }
-        // Course Watcher not installed: open IITM add/drop portal directly.
-        return executeOpenUrl(
-            "https://ecampus.iitm.ac.in/student/AddDropCourses.aspx",
-            "Course Watcher isn't installed. Opening the IITM add/drop portal — check for new courses there."
-        )
-    }
-
     private fun hasPermission(permission: String): Boolean =
         ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
 
@@ -1239,9 +1166,9 @@ class CommandRouter(private val context: Context) {
             .format(Calendar.getInstance().time) + "."
 
     companion object {
-        // Ride apps named as whole words: "escola" and "Uberlândia" aren't rides.
-        private val RIDE_APPS = Regex("\\b(uber|ola|rapido)\\b")
-        private val OLA = Regex("\\bola\\b")
+        // How long a ride or food app gets to open before its field is tapped, and then typed into.
+        private const val FILL_TAP_MS = 4_200L
+        private const val FILL_TYPE_MS = 6_000L
         // WhatsApp, as it's called in Brazil.
         private val ZAP = Regex("\\bzap(zap)?\\b")
 
@@ -1290,21 +1217,6 @@ class CommandRouter(private val context: Context) {
         )
         // How long an event added by voice lasts, when all that was said is when it starts.
         private const val EVENT_LENGTH_MS = 60 * 60_000L
-
-        /** Music app display-name → package, in preference order for auto-detect. */
-        val APP_TO_PKG = linkedMapOf(
-            "spotify"       to "com.spotify.music",
-            "youtube music" to "com.google.android.apps.youtube.music",
-            "yt music"      to "com.google.android.apps.youtube.music",
-            "jiosaavn"      to "com.jio.media.jiobeats",
-            "jio saavn"     to "com.jio.media.jiobeats",
-            "saavn"         to "com.jio.media.jiobeats",
-            "gaana"         to "com.gaana",
-            "wynk"          to "com.wynk.music",
-            "resso"         to "com.resso.app",
-            "samsung music" to "com.samsung.android.app.music",
-            "music"         to "com.android.music",
-        )
 
         private val UNITS = mapOf(
             "zero" to 0, "one" to 1, "two" to 2, "three" to 3, "four" to 4,

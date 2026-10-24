@@ -129,8 +129,8 @@ class LocalBrain(private val context: Context) {
               {"action":"navigate","destination":"<place>"}
               {"action":"maps_search","query":"<place or type of place>"}
               {"action":"open_url","url":"<website>"}
-              {"action":"ride","destination":"<place>","app":"<uber|ola|rapido|>"}
-              {"action":"order_food","query":"<food or restaurant>","app":"<swiggy|zomato|>"}
+              {"action":"ride","destination":"<place>","app":"<uber|didi|>"}
+              {"action":"order_food","query":"<food or restaurant>","app":"<uber eats|doordash|>"}
               {"action":"note","text":"<note text>"}
               {"action":"email","to":"<contact or address>","subject":"<text>","body":"<text>"}
               {"action":"weather","city":"<city>"}
@@ -152,11 +152,11 @@ class LocalBrain(private val context: Context) {
             User request: take me to the airport -> {"action":"navigate","destination":"airport"}
             User request: find coffee near me -> {"action":"maps_search","query":"coffee"}
             User request: book an uber to the mall -> {"action":"ride","destination":"the mall","app":"uber"}
-            User request: order food on swiggy -> {"action":"order_food","query":"","app":"swiggy"}
+            User request: order food on doordash -> {"action":"order_food","query":"","app":"doordash"}
             User request: note that I parked on level 3 -> {"action":"note","text":"parked on level 3"}
             User request: turn on the flashlight -> {"action":"flashlight","state":"on"}
             User request: what's my battery -> {"action":"battery"}
-            User request: weather in Mumbai -> {"action":"weather","city":"Mumbai"}
+            User request: weather in Sydney -> {"action":"weather","city":"Sydney"}
             User request: what's the capital of Japan -> {"action":"chat","reply":"It's Tokyo."}
         """.trimIndent()
     }

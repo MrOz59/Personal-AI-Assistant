@@ -135,12 +135,12 @@ class CloudBrainTest {
     fun systemPromptCarriesPersonaNameFactsAndFormat() {
         val prompt = CloudBrain.systemPrompt(
             persona = "You are Naomi, dry-witted.",
-            ctx = TurnContext(mapOf("name" to "Ozzy", "mom" to "Amma")),
+            ctx = TurnContext(mapOf("name" to "Ozzy", "mom" to "Maria")),
             now = Date(0)
         )
         assertTrue(prompt.startsWith("You are Naomi, dry-witted."))
         assertTrue(prompt.contains("The user's name is Ozzy."))
-        assertTrue(prompt.contains("their mom is Amma"))
+        assertTrue(prompt.contains("their mom is Maria"))
         assertFalse("name is listed as a name, not a remembered fact", prompt.contains("their name is Ozzy"))
         assertTrue(prompt.contains("\"say\""))
         assertTrue(prompt.contains("{\"type\":\"set_alarm\""))

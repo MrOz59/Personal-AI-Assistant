@@ -67,15 +67,17 @@ class Speaker(context: Context) {
     private fun pickVoice(language: Language) {
         voiceLanguage = language
         val portuguese = language == Language.PORTUGUESE
-        // Without a female voice to pick, the engine's own voice for Indian English or Brazilian Portuguese.
-        val fallback = if (portuguese) Locale("pt", "BR") else Locale("en", "IN")
+        // Without a female voice to pick, the engine's own voice for the English spoken where the
+        // phone is ("en-AU" in Australia), or for Brazilian Portuguese.
+        val fallback = if (portuguese) Locale("pt", "BR") else Locale.forLanguageTag(VoiceInput.englishHere(appContext))
         val voices = tts.voices ?: run {
             tts.language = fallback
             return
         }
         // Prefer: offline, in her language, female label, highest quality.
-        // English: en-IN > en-US > en-GB > any English. Portuguese: pt-BR > any Portuguese.
-        val countryBonus = if (portuguese) mapOf("BR" to 200) else mapOf("IN" to 200, "US" to 100, "GB" to 50)
+        // English: the phone's region's > en-US > en-GB > any English. Portuguese: pt-BR > any Portuguese.
+        val countryBonus = if (portuguese) mapOf("BR" to 200)
+            else mapOf("US" to 100, "GB" to 50) + (fallback.country.uppercase() to 200)
         fun score(v: Voice): Int {
             if (v.isNetworkConnectionRequired) return -1
             if (v.locale.language != fallback.language) return -1

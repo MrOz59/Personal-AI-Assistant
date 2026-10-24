@@ -13,7 +13,7 @@ import android.view.accessibility.AccessibilityNodeInfo
  * Two jobs:
  *  1. Auto-tap WhatsApp's "Send" button after Naomi opens a pre-filled chat (legacy behavior).
  *  2. General screen control: read whatever app is in the foreground and tap / scroll / type
- *     by voice — e.g. "place the order", "select auto", "tap checkout". The Activity sends
+ *     by voice — e.g. "place the order", "select UberX", "tap checkout". The Activity sends
  *     itself to the background first so the target app is on top, then calls [perform].
  *
  * The user enables this once in Settings → Accessibility → Naomi. Fragile by nature: it depends
